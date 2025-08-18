@@ -134,8 +134,7 @@ For more details, refer to the documentation or the associated research paper.
 ## Citation
 If you find this work useful, please consider citing:
 ```bibtex
-@article{
-sandri2025ssp,
+@article{sandri2025ssp,
 title={2{SSP}: A Two-Stage Framework for Structured Pruning of {LLM}s},
 author={Fabrizio Sandri and Elia Cunegatti and Giovanni Iacca},
 journal={Transactions on Machine Learning Research},
