@@ -7,7 +7,7 @@
 
 
 
-**Published in Transaction of Machine Learning Research (TMLR)** <br>
+**Published in Transactions on Machine Learning Research (TMLR)** <br>
 & <br>
 *Accepted at Workshop Sparsity in LLMs (SLLM) @ ICLR 2025*
 
