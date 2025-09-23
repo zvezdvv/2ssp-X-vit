@@ -1,7 +1,10 @@
-torch==2.3.1
 transformers==4.47.1
 ml_collections==1.0.0
-numpy==1.26.4
 datasets==3.2.0
 sentencepiece==0.2.0
 protobuf
+# Added for ViT pruning experiment
+accelerate
+# timm is an optional dependency for some vision models; included for completeness
+timm
+torchvision

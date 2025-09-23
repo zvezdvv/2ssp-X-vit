@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 
 from src.evaluation import *
 from src.utilities import *
-from src.datasets import *
+from src.local_datasets import *
 from src.pruning import *
 from src.evopress import *
 from src.slicegpt import *
