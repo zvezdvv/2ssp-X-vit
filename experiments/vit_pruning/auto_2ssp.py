@@ -25,6 +25,7 @@ from src.vit_pruning import (
     count_total_params,
     compute_actual_sparsity,
     save_cifar_adapter,
+    load_cifar_adapter,
     save_report,
     _get_encoder,
 )
@@ -154,19 +155,23 @@ def run(args):
 
     hidden = model.config.hidden_size
     # Configure classifier / adapter
-    if args.use_adapter:
-        original_out = model.classifier.out_features
-        bottleneck = max(hidden // args.adapter_reduction, 32)
-        model.classifier = nn.Sequential(
-            nn.Linear(hidden, bottleneck, bias=False),
-            nn.GELU(),
-            nn.Linear(bottleneck, original_out, bias=True),
-        )
-        print(f"[INFO] Using adapter head with bottleneck={bottleneck}")
-    elif args.replace_classifier:
-        model.classifier = nn.Linear(hidden, 10)
-        model.config.num_labels = 10
-        print("[INFO] Replaced classifier for 10 classes")
+    if getattr(args, "load_adapter", None):
+        model = load_cifar_adapter(args.load_adapter, model)
+        print(f"[INFO] Loaded adapter from: {args.load_adapter} (num_labels={getattr(model.config,'num_labels', None)}, type={model.classifier.__class__.__name__})")
+    else:
+        if args.use_adapter:
+            original_out = model.classifier.out_features
+            bottleneck = max(hidden // args.adapter_reduction, 32)
+            model.classifier = nn.Sequential(
+                nn.Linear(hidden, bottleneck, bias=False),
+                nn.GELU(),
+                nn.Linear(bottleneck, original_out, bias=True),
+            )
+            print(f"[INFO] Using adapter head with bottleneck={bottleneck}")
+        elif args.replace_classifier:
+            model.classifier = nn.Linear(hidden, 10)
+            model.config.num_labels = 10
+            print("[INFO] Replaced classifier for 10 classes")
 
     if args.freeze_backbone:
         for p in model.vit.parameters():
@@ -211,12 +216,15 @@ def run(args):
 
     # Stage-2: depth pruning
     depth_fraction = (plan.blocks_to_prune / max(1, B))
+    print(f"[INFO] Depth importance mode: {args.depth_importance}")
     res = prune_vit_attention_blocks(
         model,
         sparsity=depth_fraction,
         dataloader=test_loader if test_loader is not None else None,
         device=device,
         batch_limit=args.eval_batches,
+        importance_mode=args.depth_importance,
+        show_progress=True,
     )
     model = res["model"]
     pruned_indices = res["pruned_indices"]
@@ -345,6 +353,14 @@ def build_argparser():
     p.add_argument("--adapter-reduction", type=int, default=4)
     p.add_argument("--save-adapter", action="store_true", help="Save adapter/classifier state dict")
     p.add_argument("--eval-batches", type=int, default=5, help="Max batches to use for quick evaluation")
+    p.add_argument("--load-adapter", type=str, default=None, help="Path to saved adapter.pt to load into model classifier")
+    p.add_argument(
+        "--depth-importance",
+        type=str,
+        default="copy",
+        choices=["copy", "heuristic"],
+        help="Depth importance mode: 'copy' (accurate, slower; shows per-block progress) or 'heuristic' (fast, no eval).",
+    )
     # Control whether pruned model is persisted or discarded
     p.add_argument("--save-pruned-model", action="store_true", help="Persist pruned model to --pruned-output-dir (default: do not save)")
     p.add_argument("--pruned-output-dir", type=str, default=str((Path(__file__).resolve().parent / "pruned_models")), help="Directory to save pruned model (subfolder by run_id)")

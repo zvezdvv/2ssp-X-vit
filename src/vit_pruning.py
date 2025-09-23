@@ -16,6 +16,7 @@ __all__ = [
     "count_block_params",
     "compute_actual_sparsity",
     "save_cifar_adapter",
+    "load_cifar_adapter",
     "save_report",
 ]
 
@@ -217,7 +218,9 @@ def prune_vit_attention_blocks(
     dataloader=None,
     device: str = "cuda",
     batch_limit: int = 5,
-    metric_fn=None
+    metric_fn=None,
+    importance_mode: str = "copy",
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
     """Remove entire transformer blocks (Depth Pruning, Stage-2 of 2SSP).
 
@@ -254,50 +257,56 @@ def prune_vit_attention_blocks(
         return {"model": vit_model, "pruned_indices": [], "original_metrics": None, "final_metrics": None}
 
     # If no dataloader provided, use simple position heuristic
-    if dataloader is None:
-        print("No dataloader provided. Using position-based heuristic for pruning.")
+    # If fast heuristic requested or no dataloader, use heuristic regardless
+    if dataloader is None or (isinstance(importance_mode, str) and importance_mode.lower() == "heuristic"):
+        print("Using heuristic for depth pruning importance (position-based).")
         # Heuristic: middle blocks tend to be less critical
         importance_scores = [(i if i < num_blocks / 2 else num_blocks - i) for i in range(num_blocks)]
         to_prune = sorted(range(num_blocks), key=lambda i: importance_scores[i])[:num_to_prune]
         original_metrics = None
         final_metrics = None
     else:
-        print(f"Evaluating {num_blocks} blocks by impact on accuracy...")
+        print(f"Evaluating {num_blocks} blocks by impact on accuracy (copy-remove)...")
         original_metrics = evaluate_top1(vit_model, dataloader, device, max_batches=batch_limit, progress=True)
         print(f"Baseline accuracy: {original_metrics:.4f}")
 
         impact_scores = []
 
-        # Disable a block by short-circuiting block.forward to identity on hidden_states
-        def identity_block_forward(block, hidden_states, *args, **kwargs):
-            # Direct passthrough: emulate removing the block
-            return hidden_states
+        # Evaluate impact by actually removing one block at a time on a copy,
+        # to avoid forward-signature/shape mismatches when patching.
+        try:
+            from tqdm.auto import tqdm as _tqdm
+        except Exception:
+            _tqdm = None
+        iterable = range(num_blocks)
+        if show_progress and _tqdm is not None:
+            iterable = _tqdm(range(num_blocks), desc="Depth eval (copy-remove)", leave=False)
 
-        for block_idx in range(num_blocks):
-            # Reset model copy
-            model_copy = copy.deepcopy(vit_model)
-            model_copy.eval()
-            enc_copy = _get_encoder(model_copy)
-
-            target_block = enc_copy.layer[block_idx]
-
-            # Monkey-patch forward
-            original_fwd = target_block.forward
+        for block_idx in iterable:
             try:
-                target_block.forward = lambda hidden_states, *a, **kw: identity_block_forward(target_block, hidden_states, *a, **kw)
+                model_copy = copy.deepcopy(vit_model)
+                model_copy.eval()
+                enc_copy = _get_encoder(model_copy)
+
+                keep_indices = [i for i in range(num_blocks) if i != block_idx]
+                new_layers = nn.ModuleList([copy.deepcopy(enc_copy.layer[i]) for i in keep_indices])
+                enc_copy.layer = new_layers
+                if hasattr(model_copy, "config"):
+                    model_copy.config.num_hidden_layers = len(new_layers)
+
                 score = evaluate_top1(model_copy, dataloader, device, max_batches=batch_limit, progress=False)
-                impact = original_metrics - score
-                impact_scores.append(max(impact, 0.0))
+                impact = max(0.0, original_metrics - score)
+                impact_scores.append(impact)
+                if show_progress:
+                    print(f"[Depth] Block {block_idx} impact: {impact:.4f}", flush=True)
             except Exception as e:
                 print(f"Error evaluating block {block_idx}: {e}")
                 impact_scores.append(0.0)
             finally:
-                # restore
                 try:
-                    target_block.forward = original_fwd
+                    del model_copy, enc_copy
                 except Exception:
                     pass
-                del model_copy, enc_copy, target_block
 
         # select lowest impact blocks
         to_prune = sorted(range(num_blocks), key=lambda i: impact_scores[i])[:num_to_prune]
@@ -473,6 +482,82 @@ def save_cifar_adapter(model: nn.Module, out_dir: str, filename: str = "adapter.
     }
     torch.save(payload, path)
     return path
+
+@torch.no_grad()
+def load_cifar_adapter(path: str, model: nn.Module) -> nn.Module:
+    """Load a previously saved CIFAR adapter/head (from save_cifar_adapter) into a model.
+
+    This reconstructs either a Linear classifier or a Sequential(adapter) based on saved payload,
+    sets model.classifier accordingly, and updates model.config.num_labels.
+
+    Args:
+        path: path to adapter.pt saved by save_cifar_adapter
+        model: ViTForImageClassification instance to modify in-place
+
+    Returns:
+        The same model instance with classifier replaced and weights loaded.
+    """
+    payload = torch.load(path, map_location="cpu")
+    state_dict: Dict[str, torch.Tensor] = payload.get("state_dict", {})
+    classifier_type: str = payload.get("classifier_type", "Linear")
+    num_labels: Optional[int] = payload.get("num_labels", None)
+    saved_hidden: Optional[int] = payload.get("hidden_size", None)
+
+    # Try to infer shapes from state_dict if metadata missing
+    inferred_hidden = None
+    inferred_bottleneck = None
+    inferred_out = None
+
+    if "weight" in state_dict:  # Linear classifier case
+        w = state_dict["weight"]
+        inferred_out, inferred_hidden = int(w.shape[0]), int(w.shape[1])
+    else:
+        # Sequential adapter case: expect keys like "0.weight" and "2.weight"
+        if "0.weight" in state_dict and "2.weight" in state_dict:
+            w0 = state_dict["0.weight"]  # [bottleneck, hidden]
+            w2 = state_dict["2.weight"]  # [out, bottleneck]
+            inferred_bottleneck = int(w0.shape[0])
+            inferred_hidden = int(w0.shape[1])
+            inferred_out = int(w2.shape[0])
+
+    hidden = saved_hidden or getattr(model.config, "hidden_size", None) or inferred_hidden
+    if hidden is None:
+        raise RuntimeError("Cannot determine hidden size for adapter loading.")
+    if num_labels is None and inferred_out is not None:
+        num_labels = inferred_out
+
+    if classifier_type == "Linear" or ("weight" in state_dict and "bias" in state_dict):
+        # Simple linear head
+        if num_labels is None:
+            raise RuntimeError("num_labels is None for Linear classifier.")
+        head = nn.Linear(hidden, num_labels)
+        head.load_state_dict(state_dict)
+        model.classifier = head
+        model.config.num_labels = num_labels
+    else:
+        # Sequential adapter (Linear -> GELU -> Linear)
+        if inferred_bottleneck is None or num_labels is None:
+            # best-effort: try to read from extra or raise
+            extra = payload.get("extra", {})
+            # Try to detect bottleneck from state_dict keys if not found yet
+            if inferred_bottleneck is None and "0.weight" in state_dict:
+                inferred_bottleneck = int(state_dict["0.weight"].shape[0])
+            if inferred_out is None and "2.weight" in state_dict:
+                inferred_out = int(state_dict["2.weight"].shape[0])
+                num_labels = num_labels or inferred_out
+            if inferred_bottleneck is None or num_labels is None:
+                raise RuntimeError("Cannot reconstruct adapter architecture from payload/state_dict.")
+        bottleneck = inferred_bottleneck
+        adapter = nn.Sequential(
+            nn.Linear(hidden, bottleneck, bias=False),
+            nn.GELU(),
+            nn.Linear(bottleneck, num_labels, bias=True),
+        )
+        adapter.load_state_dict(state_dict)
+        model.classifier = adapter
+        model.config.num_labels = num_labels
+
+    return model
 
 def _to_serializable(obj):
     try:

@@ -97,6 +97,9 @@ Examples
   - python experiments/vit_pruning/auto_2ssp.py --target 0.25 --load-cifar --cifar-train-pct 0.02 --cifar-test-pct 0.05 --use-adapter
 - Persist pruned model for reuse later:
   - python experiments/vit_pruning/auto_2ssp.py --target 0.25 --load-cifar --cifar-train-pct 0.02 --cifar-test-pct 0.05 --replace-classifier --save-pruned-model
+- Reuse previously saved adapter at new sparsity (e.g., 5%):
+  - python experiments/vit_pruning/auto_2ssp.py --target 0.05 --load-cifar --cifar-train-pct 0.4 --cifar-test-pct 0.2 --load-adapter experiments/vit_pruning/artifacts/20250923-213804/adapter.pt --freeze-backbone
+  - (Optional) add --do-finetune to slightly adapt the reused head on the new split
 
 Troubleshooting
 - If accuracy is extremely low with REPLACE_CLASSIFIER and no fine-tuning, remember the new head is randomly initialized. Use --do-finetune and optionally --freeze-backbone for a quick head-only adaptation.

@@ -1,0 +1,48 @@
+{
+  "config": {
+    "model": "google/vit-base-patch16-224",
+    "target_sparsity": 0.15,
+    "freeze_backbone": true,
+    "replace_classifier": false,
+    "use_adapter": false,
+    "adapter_reduction": null,
+    "eval_batches": 5,
+    "min_remaining": 512,
+    "cifar_load": true
+  },
+  "plan": {
+    "target_sparsity": 0.15,
+    "num_blocks_total": 12,
+    "blocks_to_prune": 0,
+    "per_block_neurons_to_prune": 698,
+    "stage2_fraction": 0.0,
+    "estimated_total_removed_params": 12873912,
+    "est_error_params": 2960
+  },
+  "metrics": {
+    "params_before_stage1": 85806346,
+    "params_after_stage1": 72932434,
+    "params_after_stage2": 72932434,
+    "params_before_stage1_millions": 85.81,
+    "params_after_stage1_millions": 72.93,
+    "params_after_stage2_millions": 72.93,
+    "stage1_reduction_percent": 15.0,
+    "stage2_reduction_percent": 0.0,
+    "total_reduction_percent": 15.0,
+    "latency_baseline_ms": 50.05,
+    "latency_stage1_ms": 48.35,
+    "latency_stage2_ms": 41.38,
+    "latency_stage1_change_percent": -3.4,
+    "latency_stage2_change_percent": -14.4,
+    "latency_total_change_percent": -17.3,
+    "acc_baseline": 0.9375,
+    "acc_stage1": 0.6656,
+    "acc_stage2": 0.6656,
+    "acc_drop_stage1_percent": 29.0,
+    "acc_drop_stage2_percent": 0.0,
+    "acc_total_drop_percent": 29.0
+  },
+  "artifacts": {
+    "pruned_block_indices": []
+  }
+}
