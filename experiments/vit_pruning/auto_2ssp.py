@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+"""python3 experiments/vit_pruning/auto_2ssp.py --target 0.1 --load-cifar --cifar-train-pct 0.4 --cifar-test-pct 0.2 --load-adapter experiments/vit_pruning/artifacts/20250923-213804/adapter.pt --freeze-backbone --depth-importance copy --eval-batches 5 --force-depth-blocks 1"""
+
 import argparse
 import os
 import time
@@ -199,7 +202,12 @@ def run(args):
         acc_baseline = None
 
     # Plan allocation
-    plan = plan_2ssp_allocation(model, args.target, min_remaining=args.min_remaining)
+    plan = plan_2ssp_allocation(
+        model,
+        args.target,
+        min_remaining=args.min_remaining,
+        forced_blocks=args.force_depth_blocks,
+    )
     print(f"[PLAN] target={plan.target_sparsity:.3f}, blocks_to_prune={plan.blocks_to_prune}, per_block_neurons_to_prune={plan.per_block_neurons_to_prune}")
 
     # Stage-1: width pruning
@@ -217,6 +225,8 @@ def run(args):
     # Stage-2: depth pruning
     depth_fraction = (plan.blocks_to_prune / max(1, B))
     print(f"[INFO] Depth importance mode: {args.depth_importance}")
+    if args.force_depth_blocks is not None:
+        print(f"[INFO] Forcing depth pruning to remove exactly {args.force_depth_blocks} block(s). Width (Stage-1) adjusted to meet target.")
     res = prune_vit_attention_blocks(
         model,
         sparsity=depth_fraction,
@@ -225,6 +235,7 @@ def run(args):
         batch_limit=args.eval_batches,
         importance_mode=args.depth_importance,
         show_progress=True,
+        num_to_prune=args.force_depth_blocks,
     )
     model = res["model"]
     pruned_indices = res["pruned_indices"]
@@ -360,6 +371,12 @@ def build_argparser():
         default="copy",
         choices=["copy", "heuristic"],
         help="Depth importance mode: 'copy' (accurate, slower; shows per-block progress) or 'heuristic' (fast, no eval).",
+    )
+    p.add_argument(
+        "--force-depth-blocks",
+        type=int,
+        default=None,
+        help="Force Stage-2 to remove exactly this number of encoder blocks. Stage-1 width pruning will be adjusted to hit the global target.",
     )
     # Control whether pruned model is persisted or discarded
     p.add_argument("--save-pruned-model", action="store_true", help="Persist pruned model to --pruned-output-dir (default: do not save)")

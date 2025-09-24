@@ -221,6 +221,7 @@ def prune_vit_attention_blocks(
     metric_fn=None,
     importance_mode: str = "copy",
     show_progress: bool = True,
+    num_to_prune: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Remove entire transformer blocks (Depth Pruning, Stage-2 of 2SSP).
 
@@ -250,10 +251,13 @@ def prune_vit_attention_blocks(
     encoder_copy = _get_encoder(model_copy)
 
     num_blocks = len(encoder.layer)
-    num_to_prune = max(0, min(num_blocks - 1, int(round(num_blocks * sparsity))))
+    # Allow exact control over number of blocks to prune, if provided
+    if num_to_prune is None:
+        num_to_prune = int(round(num_blocks * sparsity))
+    num_to_prune = max(0, min(num_blocks - 1, int(num_to_prune)))
 
     if num_to_prune == 0:
-        print("No encoder blocks to prune based on sparsity.")
+        print("No encoder blocks to prune (num_to_prune=0).")
         return {"model": vit_model, "pruned_indices": [], "original_metrics": None, "final_metrics": None}
 
     # If no dataloader provided, use simple position heuristic
@@ -366,6 +370,7 @@ def plan_2ssp_allocation(
     vit_model,
     target_sparsity: float,
     min_remaining: int = 256,
+    forced_blocks: Optional[int] = None,
 ) -> TwoSSPPlan:
     """Plan Stage-1 (width) and Stage-2 (depth) amounts given a single TARGET_SPARSITY.
 
@@ -398,8 +403,11 @@ def plan_2ssp_allocation(
 
     P_block_mean = sum(block_params) / max(1, B)
 
-    for K in range(0, max(0, B - 1) + 1):
-        # Removed by depth:
+    # If depth is forced, search only that K; otherwise scan all K
+    K_values = [max(0, min(B - 1, int(forced_blocks)))] if forced_blocks is not None else list(range(0, max(0, B - 1) + 1))
+
+    for K in K_values:
+        # Removed by depth (approximate with mean block params):
         P_removed_depth = int(round(K * P_block_mean))
 
         # Remaining to remove by width:
