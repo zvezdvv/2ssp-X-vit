@@ -180,6 +180,7 @@ def prune_vit_mlp_width(
     device: str = "cuda",
     batch_limit: Optional[int] = None,
     progress: bool = False,
+    collect_masks: bool = False,
 ):
     """Width pruning of MLP intermediate dimension across all ViT blocks.
 
@@ -212,6 +213,9 @@ def prune_vit_mlp_width(
             vit_model, dataloader, device=device, batch_limit=batch_limit, progress=progress
         )
 
+    pruned_indices_all: List[List[int]] = []
+    prune_masks_all: List[List[int]] = []
+
     for block_idx, (inter_dense, out_dense) in enumerate(mlp_pairs):
         W_int: torch.Tensor = inter_dense.weight  # [intermediate, hidden]
         B_int: torch.Tensor = inter_dense.bias    # [intermediate]
@@ -243,6 +247,14 @@ def prune_vit_mlp_width(
         keep_idx = torch.argsort(importance, descending=True)[: n_channels - n_prune]
         keep_idx, _ = torch.sort(keep_idx)
 
+        # Collect mask/indices before modifying weights
+        prune_mask = torch.ones(n_channels, dtype=torch.int16, device=keep_idx.device)
+        prune_mask[keep_idx] = 0  # 1 = to prune, 0 = keep
+        pruned_idx = torch.nonzero(prune_mask == 1, as_tuple=False).view(-1).tolist()
+        if collect_masks:
+            prune_masks_all.append(prune_mask.detach().cpu().tolist())
+            pruned_indices_all.append(pruned_idx)
+
         new_W_int = W_int[keep_idx].clone()
         new_B_int = B_int[keep_idx].clone() if B_int is not None else None
         new_W_out = W_out[:, keep_idx].clone()
@@ -259,6 +271,12 @@ def prune_vit_mlp_width(
         out_dense.weight = nn.Parameter(new_W_out)
         out_dense.in_features = new_intermediate
 
+    if collect_masks:
+        return {
+            "model": vit_model,
+            "ffn_pruned_indices": pruned_indices_all,
+            "ffn_prune_masks": prune_masks_all,
+        }
     return vit_model
 
 # =========================
