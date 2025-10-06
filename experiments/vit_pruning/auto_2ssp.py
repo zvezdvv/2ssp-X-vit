@@ -213,7 +213,18 @@ def run(args):
     # Stage-1: width pruning
     B = len(_get_encoder(model).layer)
     n_to_prune_per_block = [plan.per_block_neurons_to_prune] * B
-    model = prune_vit_mlp_width(model, n_to_prune_per_block=n_to_prune_per_block, min_remaining=args.min_remaining)
+    # Use calibration-driven importance (avg L2 of FFN activations over tokens/samples)
+    cal_loader = train_loader if train_loader is not None else test_loader
+    model = prune_vit_mlp_width(
+        model,
+        n_to_prune_per_block=n_to_prune_per_block,
+        min_remaining=args.min_remaining,
+        strategy="act_l2",
+        dataloader=cal_loader,
+        device=device,
+        batch_limit=args.eval_batches,
+        progress=True,
+    )
 
     params_after_stage1 = count_total_params(model)
     latency_stage1 = measure_latency(model, device, warmup=3, iters=10)

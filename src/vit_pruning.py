@@ -95,12 +95,91 @@ def compute_actual_sparsity(before_params: int, after_params: int) -> float:
 # =========================
 
 @torch.no_grad()
+def _compute_ffn_activation_importance(
+    vit_model,
+    dataloader,
+    device: str = "cuda",
+    batch_limit: Optional[int] = None,
+    progress: bool = False,
+) -> List[torch.Tensor]:
+    """Compute per-neuron importance for FFN intermediate activations using average L2 norm over tokens,
+    averaged across calibration samples.
+
+    Returns:
+        List of length B (num blocks), each a 1D tensor [d_int] with importance scores s_j.
+    """
+    vit_model.eval()
+    encoder = _get_encoder(vit_model)
+    B = len(encoder.layer)
+
+    sums: List[Optional[torch.Tensor]] = [None for _ in range(B)]
+    counts = 0
+
+    def make_hook(b: int):
+        def hook(module, _inp, out):
+            # out: [batch, seq_len, d_int]
+            with torch.no_grad():
+                val = out
+                if isinstance(val, (tuple, list)):
+                    val = val[0]
+                # L2 over tokens -> [batch, d_int], then sum over batch -> [d_int]
+                per_sample = torch.linalg.vector_norm(val, ord=2, dim=1)  # [B, d_int]
+                acc = per_sample.sum(dim=0)  # [d_int]
+                acc_cpu = acc.detach().to("cpu")
+                if sums[b] is None:
+                    sums[b] = acc_cpu
+                else:
+                    sums[b] += acc_cpu
+        return hook
+
+    handles = []
+    try:
+        for b in range(B):
+            handles.append(encoder.layer[b].intermediate.register_forward_hook(make_hook(b)))
+
+        iterator = dataloader
+        if progress:
+            try:
+                from tqdm.auto import tqdm as _tqdm  # lazy
+                iterator = _tqdm(dataloader, total=(batch_limit if batch_limit is not None else None), desc="S1 activations", leave=False)
+            except Exception:
+                pass
+
+        autocast_dev = "cuda" if str(device).startswith("cuda") else ("mps" if str(device).startswith("mps") else "cpu")
+        for i, batch in enumerate(iterator):
+            if batch_limit is not None and i >= batch_limit:
+                break
+            px = batch["pixel_values"].to(device, non_blocking=True)
+            with torch.autocast(device_type=autocast_dev, enabled=True):
+                _ = vit_model(pixel_values=px)
+            counts += px.size(0)
+    finally:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+
+    imps: List[torch.Tensor] = []
+    for b in range(B):
+        d_int = encoder.layer[b].intermediate.dense.out_features
+        if sums[b] is None:
+            imps.append(torch.zeros(d_int))
+        else:
+            imps.append(sums[b] / max(1, counts))
+    return imps
+
+@torch.no_grad()
 def prune_vit_mlp_width(
     vit_model,
     sparsity: Optional[float] = None,
     strategy: str = "l1",
     min_remaining: int = 256,
     n_to_prune_per_block: Optional[List[int]] = None,
+    dataloader=None,
+    device: str = "cuda",
+    batch_limit: Optional[int] = None,
+    progress: bool = False,
 ):
     """Width pruning of MLP intermediate dimension across all ViT blocks.
 
@@ -125,12 +204,25 @@ def prune_vit_mlp_width(
         if not (0.0 <= sparsity < 1.0):
             raise AssertionError("sparsity must be in [0,1)")
 
+    # Activation-based importance (paper S1): average L2 of activations over tokens and calibration samples
+    importance_blocks: Optional[List[torch.Tensor]] = None
+    if strategy == "act_l2" and dataloader is not None:
+        print("[S1-LOG] Using activation-based importance (avg L2 over tokens, averaged across calibration samples)")
+        importance_blocks = _compute_ffn_activation_importance(
+            vit_model, dataloader, device=device, batch_limit=batch_limit, progress=progress
+        )
+
     for block_idx, (inter_dense, out_dense) in enumerate(mlp_pairs):
         W_int: torch.Tensor = inter_dense.weight  # [intermediate, hidden]
         B_int: torch.Tensor = inter_dense.bias    # [intermediate]
         W_out: torch.Tensor = out_dense.weight    # [hidden, intermediate]
+        n_channels = W_int.size(0)
 
-        if strategy == "l1":
+        if strategy == "act_l2" and importance_blocks is not None:
+            importance = importance_blocks[block_idx].to(W_int.device)
+            if importance.numel() != n_channels:
+                raise RuntimeError("act_l2 importance size mismatch with intermediate width")
+        elif strategy == "l1":
             importance = W_int.abs().sum(dim=1)
         else:
             raise ValueError(f"Unknown strategy {strategy}")
@@ -144,6 +236,7 @@ def prune_vit_mlp_width(
         # respect min_remaining
         if n_channels - n_prune < min_remaining:
             n_prune = max(0, n_channels - min_remaining)
+        print(f"[S1-LOG] block={block_idx}, inter={n_channels}, n_prune={n_prune}, strategy={strategy}")
         if n_prune <= 0:
             continue
 
@@ -345,6 +438,18 @@ def _count_attention_params_per_block(vit_model) -> List[int]:
             counts.append(sum(p.numel() for p in attn.parameters()))
     return counts
 
+@torch.no_grad()
+def _count_ffn_params_per_block(vit_model) -> List[int]:
+    """Return per-block parameter counts for the FFN submodules (intermediate.dense + output.dense)."""
+    encoder = _get_encoder(vit_model)
+    counts: List[int] = []
+    for layer in encoder.layer:  # type: ignore[attr-defined]
+        inter = layer.intermediate.dense
+        out = layer.output.dense
+        cnt = sum(p.numel() for p in inter.parameters()) + sum(p.numel() for p in out.parameters())
+        counts.append(cnt)
+    return counts
+
 # ==================================
 # Auto-allocation for single sparsity
 # ==================================
@@ -404,6 +509,13 @@ def plan_2ssp_allocation(
     max_removable_per_block = [max(0, inter - min_remaining) for inter in inter_sizes]
     t_max_uniform = min(max_removable_per_block) if max_removable_per_block else 0
 
+    # Debug: constants used by planner
+    denom_const = B * (2 * hidden + 1)
+    print(f"[PLAN-LOG] B={B}, target_sparsity={target_sparsity}, P_target={P_target}")
+    print(f"[PLAN-LOG] hidden={hidden}, inter_sizes={inter_sizes}, min_remaining={min_remaining}")
+    print(f"[PLAN-LOG] total_params={total_params}, block_params={block_params}")
+    print(f"[PLAN-LOG] t_max_uniform={t_max_uniform}, denom=B*(2*hidden+1)={denom_const}")
+
     # Prefer using some attention pruning when multiple allocations achieve similar total removal.
     # Tolerance: treat solutions within ~2% of the target removed params as equivalent, then prefer larger K.
     tol = max(1, int(0.02 * P_target))
@@ -412,8 +524,37 @@ def plan_2ssp_allocation(
     attn_param_counts = _count_attention_params_per_block(vit_model)
     P_attn_mean = sum(attn_param_counts) / max(1, B)
 
-    # If depth is forced, search only that K; otherwise scan all K
-    K_values = [max(0, min(B - 1, int(forced_blocks)))] if forced_blocks is not None else list(range(0, max(0, B - 1) + 1))
+    # Compute FFN params per block to apply the paper's allocation formula:
+    # N_attn = round( B * s^(|W_FFN| / (alpha * |W_Attn|)) )
+    ffn_param_counts = _count_ffn_params_per_block(vit_model)
+    W_FFN = sum(ffn_param_counts) / max(1, B)   # avg FFN params per block
+    W_Attn = P_attn_mean                         # avg Attention params per block
+    alpha = 1.5
+
+    # Debug: inputs to formula
+    print(f"[PLAN-LOG] attn_params_per_block={attn_param_counts}")
+    print(f"[PLAN-LOG] ffn_params_per_block={ffn_param_counts}")
+    print(f"[PLAN-LOG] mean_params_per_block: W_FFN_avg={int(W_FFN)}, W_Attn_avg={int(W_Attn)}, alpha={alpha}")
+    if W_Attn > 0:
+        exponent = W_FFN / (alpha * W_Attn)
+    else:
+        exponent = float("inf")
+    print(f"[PLAN-LOG] exponent = W_FFN/(alpha*W_Attn) = {exponent if exponent != float('inf') else 'inf'}")
+
+    if forced_blocks is not None:
+        # Respect exact user override
+        K_values = [max(0, min(B - 1, int(forced_blocks)))]
+        print(f"[PLAN-LOG] forced_blocks provided: K_values={K_values}")
+    else:
+        if W_Attn > 0:
+            K_formula = int(round(B * (target_sparsity ** exponent)))
+        else:
+            K_formula = 0
+        K_formula = max(0, min(B - 1, K_formula))
+        # Evaluate a small neighborhood around the formula-based K to best-fit the global target
+        neighborhood = sorted(set([K_formula + d for d in (-2, -1, 0, 1, 2)]))
+        K_values = [k for k in neighborhood if 0 <= k <= B - 1]
+        print(f"[PLAN-LOG] K_formula={K_formula}, K_candidates={K_values}")
 
     for K in K_values:
         # Removed by depth (approximate with mean attention params per block):
@@ -502,12 +643,20 @@ def plan_2ssp_allocation(
         )
 
     err, K_best, t_best, P_removed_est = best
+
+    # Debug: chosen allocation and budget breakdown
+    P_removed_depth_chosen = int(round(K_best * P_attn_mean))
+    P_removed_width_chosen = _estimate_width_removal_per_block(hidden, t_best) * B
+    stage2_fraction_chosen = (K_best / B) if B > 0 else 0.0
+    print(f"[PLAN-LOG] chosen: K={K_best}, t={t_best}, stage2_fraction={stage2_fraction_chosen:.6f}")
+    print(f"[PLAN-LOG] removal_depth(attn)={P_removed_depth_chosen}, removal_width(ffn)={P_removed_width_chosen}, total={P_removed_est}, target={P_target}, err={int(err)}")
+
     return TwoSSPPlan(
         target_sparsity=target_sparsity,
         num_blocks_total=B,
         blocks_to_prune=K_best,
         per_block_neurons_to_prune=t_best,
-        stage2_fraction=(K_best / B) if B > 0 else 0.0,
+        stage2_fraction=stage2_fraction_chosen,
         estimated_total_removed_params=P_removed_est,
         est_error_params=int(err),
     )
