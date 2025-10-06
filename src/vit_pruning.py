@@ -223,111 +223,103 @@ def prune_vit_attention_blocks(
     show_progress: bool = True,
     num_to_prune: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Remove entire transformer blocks (Depth Pruning, Stage-2 of 2SSP).
+    """Prune attention submodules only in selected blocks (Stage-2 of 2SSP).
 
-    Note: Although initially drafted as "attention" block removal, this function removes whole
-    encoder.layer blocks to ensure structural consistency and speedup.
+    This function selects encoder blocks by importance and replaces each selected block's
+    attention module (e.g., ViTAttention with its Q/K/V and output projection) with a
+    parameter-free bypass. The bypass outputs zeros so that the residual addition leaves
+    the hidden states unchanged for the attention part, while the block's MLP (FFN) remains
+    intact and functional.
 
     Args:
         vit_model: HuggingFace ViT model (ViTModel or ViTForImageClassification)
-        sparsity: Fraction (0-1) of blocks to remove
+        sparsity: Fraction (0-1) of blocks whose attention submodule will be removed
         dataloader: Optional dataloader for metric-based selection
         device: Device for evaluation
         batch_limit: Max batches to process for evaluation
-        metric_fn: Custom metric function to evaluate block importance (unused, reserved)
+        metric_fn: Custom metric function to evaluate importance (unused, reserved)
+        importance_mode: "copy" to evaluate impact via copy-edit, "heuristic" for position heuristic
+        show_progress: Show progress during evaluation
+        num_to_prune: If provided, prune attention in exactly this many blocks
 
     Returns:
         Dict with pruned model and pruning information
     """
     assert 0.0 <= sparsity < 1.0, "sparsity must be in [0,1)"
 
-    # Create a copy of the model for calibration
+    class AttentionBypass(nn.Module):
+        def __init__(self):
+            super().__init__()
+        def forward(self, hidden_states, head_mask=None, output_attentions: bool = False, *args, **kwargs):
+            zeros = torch.zeros_like(hidden_states)
+            if output_attentions:
+                return (zeros, None)
+            return (zeros,)
+
     vit_model.eval()
-    model_copy = copy.deepcopy(vit_model)
-    model_copy.eval()
-
-    # Get encoder
     encoder = _get_encoder(vit_model)
-    encoder_copy = _get_encoder(model_copy)
-
     num_blocks = len(encoder.layer)
-    # Allow exact control over number of blocks to prune, if provided
+
+    # Determine how many blocks to modify
     if num_to_prune is None:
         num_to_prune = int(round(num_blocks * sparsity))
+    # Keep at least one block intact to avoid degenerate encoders in edge-cases
     num_to_prune = max(0, min(num_blocks - 1, int(num_to_prune)))
 
     if num_to_prune == 0:
-        print("No encoder blocks to prune (num_to_prune=0).")
+        print("No attention submodules to prune (num_to_prune=0).")
         return {"model": vit_model, "pruned_indices": [], "original_metrics": None, "final_metrics": None}
 
-    # If no dataloader provided, use simple position heuristic
-    # If fast heuristic requested or no dataloader, use heuristic regardless
+    # Importance selection
     if dataloader is None or (isinstance(importance_mode, str) and importance_mode.lower() == "heuristic"):
-        print("Using heuristic for depth pruning importance (position-based).")
-        # Heuristic: middle blocks tend to be less critical
+        print("Using heuristic for attention pruning importance (position-based).")
         importance_scores = [(i if i < num_blocks / 2 else num_blocks - i) for i in range(num_blocks)]
         to_prune = sorted(range(num_blocks), key=lambda i: importance_scores[i])[:num_to_prune]
         original_metrics = None
         final_metrics = None
     else:
-        print(f"Evaluating {num_blocks} blocks by impact on accuracy (copy-remove)...")
+        print(f"Evaluating {num_blocks} blocks by impact of removing attention (copy-replace)...")
         original_metrics = evaluate_top1(vit_model, dataloader, device, max_batches=batch_limit, progress=True)
         print(f"Baseline accuracy: {original_metrics:.4f}")
 
-        impact_scores = []
-
-        # Evaluate impact by actually removing one block at a time on a copy,
-        # to avoid forward-signature/shape mismatches when patching.
+        impact_scores: List[float] = []
         try:
             from tqdm.auto import tqdm as _tqdm
         except Exception:
             _tqdm = None
         iterable = range(num_blocks)
         if show_progress and _tqdm is not None:
-            iterable = _tqdm(range(num_blocks), desc="Depth eval (copy-remove)", leave=False)
+            iterable = _tqdm(range(num_blocks), desc="Attn eval (copy-replace)", leave=False)
 
         for block_idx in iterable:
             try:
                 model_copy = copy.deepcopy(vit_model)
                 model_copy.eval()
                 enc_copy = _get_encoder(model_copy)
-
-                keep_indices = [i for i in range(num_blocks) if i != block_idx]
-                new_layers = nn.ModuleList([copy.deepcopy(enc_copy.layer[i]) for i in keep_indices])
-                enc_copy.layer = new_layers
-                if hasattr(model_copy, "config"):
-                    model_copy.config.num_hidden_layers = len(new_layers)
+                if hasattr(enc_copy.layer[block_idx], "attention"):
+                    enc_copy.layer[block_idx].attention = AttentionBypass()
 
                 score = evaluate_top1(model_copy, dataloader, device, max_batches=batch_limit, progress=False)
                 impact = max(0.0, original_metrics - score)
                 impact_scores.append(impact)
                 if show_progress:
-                    print(f"[Depth] Block {block_idx} impact: {impact:.4f}", flush=True)
+                    print(f"[Attn] Block {block_idx} impact: {impact:.4f}", flush=True)
             except Exception as e:
-                print(f"Error evaluating block {block_idx}: {e}")
+                print(f"Error evaluating attention removal for block {block_idx}: {e}")
                 impact_scores.append(0.0)
-            finally:
-                try:
-                    del model_copy, enc_copy
-                except Exception:
-                    pass
 
-        # select lowest impact blocks
         to_prune = sorted(range(num_blocks), key=lambda i: impact_scores[i])[:num_to_prune]
-        print(f"Selected blocks to prune: {to_prune}")
+        print(f"Selected blocks to remove attention: {to_prune}")
 
-    # Perform actual pruning on original model
-    keep_indices = [i for i in range(num_blocks) if i not in to_prune]
-    new_layers = nn.ModuleList([copy.deepcopy(encoder.layer[i]) for i in keep_indices])
-    encoder.layer = new_layers
+    # Apply pruning on the original model: replace attention with bypass
+    for idx in to_prune:
+        if hasattr(encoder.layer[idx], "attention"):
+            encoder.layer[idx].attention = AttentionBypass()
 
-    # Update config if available
-    if hasattr(vit_model, "config"):
-        vit_model.config.num_hidden_layers = len(new_layers)
-
+    # Optional evaluation after pruning
     if dataloader is not None:
         final_metrics = evaluate_top1(vit_model, dataloader, device, max_batches=batch_limit, progress=True)
-        print(f"Final accuracy after pruning: {final_metrics:.4f}")
+        print(f"Final accuracy after attention pruning: {final_metrics:.4f}")
         if original_metrics is not None:
             print(f"Accuracy change: {final_metrics - original_metrics:.4f}")
     else:
@@ -339,6 +331,19 @@ def prune_vit_attention_blocks(
         "original_metrics": original_metrics,
         "final_metrics": final_metrics,
     }
+
+@torch.no_grad()
+def _count_attention_params_per_block(vit_model) -> List[int]:
+    """Return per-block parameter counts for the attention submodule only (encoder.layer[i].attention)."""
+    encoder = _get_encoder(vit_model)
+    counts: List[int] = []
+    for layer in encoder.layer:  # type: ignore[attr-defined]
+        attn = getattr(layer, "attention", None)
+        if attn is None:
+            counts.append(0)
+        else:
+            counts.append(sum(p.numel() for p in attn.parameters()))
+    return counts
 
 # ==================================
 # Auto-allocation for single sparsity
@@ -399,16 +404,20 @@ def plan_2ssp_allocation(
     max_removable_per_block = [max(0, inter - min_remaining) for inter in inter_sizes]
     t_max_uniform = min(max_removable_per_block) if max_removable_per_block else 0
 
+    # Prefer using some attention pruning when multiple allocations achieve similar total removal.
+    # Tolerance: treat solutions within ~2% of the target removed params as equivalent, then prefer larger K.
+    tol = max(1, int(0.02 * P_target))
     best = None
 
-    P_block_mean = sum(block_params) / max(1, B)
+    attn_param_counts = _count_attention_params_per_block(vit_model)
+    P_attn_mean = sum(attn_param_counts) / max(1, B)
 
     # If depth is forced, search only that K; otherwise scan all K
     K_values = [max(0, min(B - 1, int(forced_blocks)))] if forced_blocks is not None else list(range(0, max(0, B - 1) + 1))
 
     for K in K_values:
-        # Removed by depth (approximate with mean block params):
-        P_removed_depth = int(round(K * P_block_mean))
+        # Removed by depth (approximate with mean attention params per block):
+        P_removed_depth = int(round(K * P_attn_mean))
 
         # Remaining to remove by width:
         P_remaining = max(0, P_target - P_removed_depth)
@@ -425,8 +434,13 @@ def plan_2ssp_allocation(
         err = abs(P_target - P_removed_total)
 
         cand = (err, K, t, P_removed_total)
-        if (best is None) or (cand < best):
+        if best is None:
             best = cand
+        else:
+            best_err, best_K, _, _ = best
+            # Prefer strictly smaller error; if errors are within tolerance, prefer larger K (more attention pruning)
+            if (err < best_err - tol) or (abs(err - best_err) <= tol and K > best_K):
+                best = cand
 
         # small local tweaks around t for improved fit
         for dt in (-1, 1, 2, -2):
@@ -435,8 +449,45 @@ def plan_2ssp_allocation(
             P_removed_total_tt = P_removed_depth + P_removed_width_tt
             err_tt = abs(P_target - P_removed_total_tt)
             cand_tt = (err_tt, K, tt, P_removed_total_tt)
-            if cand_tt < best:
+            if best is None:
                 best = cand_tt
+            else:
+                best_err, best_K, _, _ = best
+                if (err_tt < best_err - tol) or (abs(err_tt - best_err) <= tol and K > best_K):
+                    best = cand_tt
+
+    # If the best allocation ends up with K=0 but the target budget is substantial
+    # relative to the average attention params per block, prefer a non-zero K alternative
+    # within tolerance to avoid degenerate "all-width" solutions.
+    if best is not None and forced_blocks is None:
+        best_err, best_K, best_t, best_total = best
+        if best_K == 0 and P_attn_mean > 0:
+            if P_target >= 0.5 * P_attn_mean:
+                # Explore K around the rough ratio of target to per-block attention params
+                K_guess = max(1, int(round(P_target / max(1, P_attn_mean))))
+                K_cand_max = min(B - 1, K_guess + 2)
+                best_alt = None
+                for K_alt in range(1, K_cand_max + 1):
+                    P_removed_depth_alt = int(round(K_alt * P_attn_mean))
+                    P_remaining_alt = max(0, P_target - P_removed_depth_alt)
+                    t_alt = int(round(P_remaining_alt / denom)) if denom > 0 else 0
+                    t_alt = max(0, min(t_alt, t_max_uniform))
+                    P_removed_width_alt = _estimate_width_removal_per_block(hidden, t_alt) * B
+                    P_total_alt = P_removed_depth_alt + P_removed_width_alt
+                    err_alt = abs(P_target - P_total_alt)
+                    cand_alt = (err_alt, K_alt, t_alt, P_total_alt)
+                    if best_alt is None:
+                        best_alt = cand_alt
+                    else:
+                        alt_err, alt_K, _, _ = best_alt
+                        if (err_alt < alt_err - tol) or (abs(err_alt - alt_err) <= tol and K_alt > alt_K):
+                            best_alt = cand_alt
+                if best_alt is not None:
+                    alt_err, alt_K, _, _ = best_alt
+                    # Switch to non-zero K if it is within tolerance of the original best error
+                    # or improves it. This enforces some attention pruning when reasonable.
+                    if (alt_err < best_err - tol) or (abs(alt_err - best_err) <= tol):
+                        best = best_alt
 
     if best is None:
         # fallback (no pruning)
