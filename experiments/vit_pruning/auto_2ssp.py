@@ -2,6 +2,10 @@
 
 """python3 experiments/vit_pruning/auto_2ssp.py --target 0.1 --load-cifar --cifar-train-pct 0.4 --cifar-test-pct 0.2 --load-adapter experiments/vit_pruning/artifacts/20250923-213804/adapter.pt --freeze-backbone --depth-importance copy --eval-batches 5 --force-depth-blocks 1"""
 """python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.15 --load-cifar --cifar-train-pct 0.4 --cifar-test-pct 0.2 --load-adapter experiments/vit_pruning/artifacts/20250923-213804/adapter.pt --eval-batches 5"""
+"""first run (no adapter yet): python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.0 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --replace-classifier --freeze-backbone --do-finetune --ft-epochs 2 --ft-lr 5e-5 --save-adapter --eval-batches 5"""
+"""CIFAR100: python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.15 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --load-adapter experiments/vit_pruning/artifacts/20251024-215318/adapter.pt --eval-batches 5"""
+"""CIFAR100: python3 experiments/vit_pruning/auto_2ssp.py --stage s2 --s2-sparsity 0.05 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --load-adapter experiments/vit_pruning/artifacts/20251024-215318/adapter.pt --eval-batches 5"""
+
 import argparse
 import os
 import time
@@ -105,34 +109,149 @@ def load_cifar10(processor, device: str, train_pct: float = 0.25, test_pct: floa
     return train_loader, test_loader
 
 
+def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 2, num_workers: Optional[int] = None):
+    # Lazy imports
+    from datasets import load_dataset
+    from torchvision import transforms
+    from torchvision.transforms import InterpolationMode
+    from torch.utils.data import DataLoader
+
+    if num_workers is None:
+        num_workers = 2 if device != "cpu" else 0
+
+    ds_name = dataset.lower()
+    assert ds_name in ("cifar10", "cifar100"), f"Unsupported dataset: {dataset}"
+    num_classes = 10 if ds_name == "cifar10" else 100
+
+    # Base splits for optional fine-tune and test evaluation
+    train_split = f"train[:{int(train_pct * 100)}%]" if train_pct is not None else "train"
+    test_split = f"test[:{int(test_pct * 100)}%]" if test_pct is not None else "test"
+
+    train_raw = load_dataset(ds_name, split=train_split)
+    test_raw = load_dataset(ds_name, split=test_split)
+    full_train_raw = load_dataset(ds_name, split="train")  # for calibration coverage
+
+    normalize = transforms.Normalize(mean=processor.image_mean, std=processor.image_std)
+    train_tf = transforms.Compose([
+        transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    test_tf = transforms.Compose([
+        transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    def extract_label(example):
+        if "label" in example:
+            return int(example["label"])
+        if "fine_label" in example:
+            return int(example["fine_label"])
+        return int(example.get("labels", 0))
+
+    def preprocess(example, train=True):
+        img = example["img"]
+        img = train_tf(img) if train else test_tf(img)
+        return {"pixel_values": img, "labels": extract_label(example)}
+
+    # Map transforms for train/test
+    train_ds = train_raw.map(lambda e: preprocess(e, True))
+    test_ds = test_raw.map(lambda e: preprocess(e, False))
+    train_ds.set_format(type="torch", columns=["pixel_values", "labels"])
+    test_ds.set_format(type="torch", columns=["pixel_values", "labels"])
+
+    # Build calibration subset with at least calib_per_class samples per class
+    calib_indices = []
+    counts = [0] * num_classes
+    for i in range(len(full_train_raw)):
+        y = extract_label(full_train_raw[i])
+        if 0 <= y < num_classes and counts[y] < calib_per_class:
+            calib_indices.append(i)
+            counts[y] += 1
+            if all(c >= calib_per_class for c in counts):
+                break
+    # Fallback to ensure at least one sample per class (shouldn't be needed for CIFAR)
+    if any(c == 0 for c in counts):
+        for i in range(len(full_train_raw)):
+            y = extract_label(full_train_raw[i])
+            if counts[y] == 0:
+                calib_indices.append(i)
+                counts[y] = 1
+            if all(c >= 1 for c in counts):
+                break
+
+    calib_raw_subset = full_train_raw.select(calib_indices)
+    calib_ds = calib_raw_subset.map(lambda e: preprocess(e, True))
+    calib_ds.set_format(type="torch", columns=["pixel_values", "labels"])
+
+    # DataLoaders
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=(device == "cuda"))
+    cal_loader = DataLoader(calib_ds, batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
+
+    return train_loader, test_loader, cal_loader
+
+
 def maybe_finetune_head(model: nn.Module, train_loader, device: str, freeze_backbone: bool, epochs: int = 1, lr: float = 5e-5):
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
         print("[INFO] No trainable parameters; skipping fine-tune.")
         return
 
-    print(f"[INFO] Fine-tuning head for {epochs} epoch(s) with {sum(p.numel() for p in trainable)/1e6:.2f}M trainable params")
+    total_params_m = sum(p.numel() for p in trainable) / 1e6
+    print(f"[INFO] Fine-tuning head for {epochs} epoch(s) with {total_params_m:.2f}M trainable params")
+
     optimizer = torch.optim.AdamW(trainable, lr=lr)
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+
+    # Use new torch.amp.GradScaler API for CUDA only; disable on MPS/CPU
+    try:
+        scaler = torch.amp.GradScaler("cuda") if device == "cuda" else None
+    except Exception:
+        from torch.cuda.amp import GradScaler as _CudaGradScaler
+        scaler = _CudaGradScaler(enabled=(device == "cuda"))
+
     autocast_dev = "cuda" if device == "cuda" else ("mps" if device == "mps" else "cpu")
 
-    model.train()
+    # Progress bar over batches with running loss on all backends (including MPS)
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except Exception:
+        _tqdm = None
+
     for epoch in range(epochs):
-        for batch in train_loader:
+        model.train()
+        running = 0.0
+        nsteps = 0
+        iterable = train_loader
+        if _tqdm is not None:
+            iterable = _tqdm(train_loader, desc=f"Finetune epoch {epoch+1}/{epochs}", leave=True)
+
+        for batch in iterable:
             optimizer.zero_grad(set_to_none=True)
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
             with torch.autocast(device_type=autocast_dev, enabled=True):
                 out = model(pixel_values=pixel_values)
                 loss = criterion(out.logits, labels)
-            if device == "cuda":
+
+            if device == "cuda" and scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
                 optimizer.step()
+
+            loss_val = float(loss.detach().cpu())
+            running += loss_val
+            nsteps += 1
+            if _tqdm is not None:
+                iterable.set_postfix(loss=f"{loss_val:.4f}", avg=f"{(running/max(1,nsteps)):.4f}")
+
+        print(f"[INFO] Epoch {epoch+1}/{epochs} done. Mean loss: {(running/max(1,nsteps)):.4f}")
 
     print("[INFO] Fine-tuning complete.")
 
@@ -153,11 +272,20 @@ def run(args):
     device = pick_device()
     print(f"[INFO] Using device: {device}")
 
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+
     model_name = args.model
     processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
     model = ViTForImageClassification.from_pretrained(model_name)
 
     hidden = model.config.hidden_size
+    # Determine dataset-derived number of labels if CIFAR is requested
+    ds_name = None
+    expected_num_labels = None
+    if args.load_cifar:
+        ds_name = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
+        expected_num_labels = 10 if ds_name == "cifar10" else 100
+
     # Configure classifier / adapter
     if getattr(args, "load_adapter", None):
         model = load_cifar_adapter(args.load_adapter, model)
@@ -173,9 +301,10 @@ def run(args):
             )
             print(f"[INFO] Using adapter head with bottleneck={bottleneck}")
         elif args.replace_classifier:
-            model.classifier = nn.Linear(hidden, 10)
-            model.config.num_labels = 10
-            print("[INFO] Replaced classifier for 10 classes")
+            out_dim = expected_num_labels if expected_num_labels is not None else getattr(model.classifier, "out_features", 10)
+            model.classifier = nn.Linear(hidden, out_dim)
+            model.config.num_labels = out_dim
+            print(f"[INFO] Replaced classifier for {out_dim} classes")
 
     if args.freeze_backbone:
         for p in model.vit.parameters():
@@ -186,9 +315,16 @@ def run(args):
 
     # Data
     if args.load_cifar:
-        train_loader, test_loader = load_cifar10(processor, device, train_pct=args.cifar_train_pct, test_pct=args.cifar_test_pct)
+        train_loader, test_loader, cal_loader = load_cifar(
+            processor,
+            device,
+            dataset=ds_name or (getattr(args, "dataset", "cifar10") or "cifar10"),
+            train_pct=args.cifar_train_pct,
+            test_pct=args.cifar_test_pct,
+            calib_per_class=getattr(args, "calib_per_class", 2),
+        )
     else:
-        train_loader = test_loader = None
+        train_loader = test_loader = cal_loader = None
 
     # Optional fine-tune
     if args.do_finetune and train_loader is not None:
@@ -238,7 +374,7 @@ def run(args):
             print(f"[S1] Using per-component sparsity: s1_sparsity={args.s1_sparsity}, n_to_prune_per_block[0]={n_to_prune_per_block[0]}")
 
         # Use calibration-driven importance (avg L2 of FFN activations over tokens/samples)
-        cal_loader = train_loader if train_loader is not None else test_loader
+        cal_loader = cal_loader if cal_loader is not None else (train_loader if train_loader is not None else test_loader)
         s1_res = prune_vit_mlp_width(
             model,
             n_to_prune_per_block=n_to_prune_per_block,
@@ -324,7 +460,6 @@ def run(args):
         )
 
     # Save artifacts and report
-    run_id = time.strftime("%Y%m%d-%H%M%S")
     reports_dir = Path(__file__).resolve().parent / "reports"
     artifacts_dir = Path(__file__).resolve().parent / "artifacts" / run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -411,6 +546,7 @@ def run(args):
             "eval_batches": args.eval_batches,
             "min_remaining": args.min_remaining,
             "cifar_load": args.load_cifar,
+            "dataset": ds_name,
         },
         "metrics": {
             "params_before_stage1": params_before,
@@ -460,14 +596,16 @@ def build_argparser():
     p.add_argument("--s1-sparsity", type=float, default=None, help="Component-wise sparsity for FFN (fraction of FFN params per block). Used when --stage s1.")
     p.add_argument("--s2-sparsity", type=float, default=None, help="Component-wise sparsity for Attention (fraction of attention params / blocks). Used when --stage s2.")
     p.add_argument("--min-remaining", type=int, default=512, help="Min remaining intermediate size per block after width pruning")
-    p.add_argument("--load-cifar", action="store_true", help="Load CIFAR-10 for quick accuracy evaluation")
+    p.add_argument("--load-cifar", action="store_true", help="Load CIFAR-10/100 for quick accuracy evaluation")
+    p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"], help="When --load-cifar is set, choose dataset variant.")
+    p.add_argument("--calib-per-class", type=int, default=2, help="Min samples per class for Stage-1 calibration dataloader")
     p.add_argument("--cifar-train-pct", type=float, default=0.25)
     p.add_argument("--cifar-test-pct", type=float, default=0.25)
     p.add_argument("--do-finetune", action="store_true", help="Lightly fine-tune the head/adapter")
     p.add_argument("--ft-epochs", type=int, default=1)
     p.add_argument("--ft-lr", type=float, default=5e-5)
     p.add_argument("--freeze-backbone", action="store_true", help="Freeze backbone and train only head/adapter")
-    p.add_argument("--replace-classifier", action="store_true", help="Replace classifier with 10-class head")
+    p.add_argument("--replace-classifier", action="store_true", help="Replace classifier head to match dataset classes (10 for CIFAR-10, 100 for CIFAR-100)")
     p.add_argument("--use-adapter", action="store_true", help="Use adapter bottleneck instead of replacing head")
     p.add_argument("--adapter-reduction", type=int, default=4)
     p.add_argument("--save-adapter", action="store_true", help="Save adapter/classifier state dict")
