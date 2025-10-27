@@ -114,3 +114,37 @@ Files of interest
   - prune_vit_attention_blocks — depth pruning by removing whole blocks, optionally evaluating impact
   - evaluate_top1 — quick top-1 accuracy estimation
   - save_cifar_adapter, save_report — for artifacts and consolidated reporting
+
+SRP/timm checkpoints (CIFAR-100, ViT-B/16)
+- Поддержана загрузка предобученных чекпоинтов ViT из SRP (timm) напрямую в auto_2ssp.py.
+- Варианты использования:
+  1) Через index.csv (автоматический выбор лучшего адаптированного под датасет чекпоинта):
+     - Создайте файл pruning_srp-main/models/index.csv
+     - Минимально необходимые колонки: name,adapt_ds,adapt_filename,adapt_final_val
+       Пример содержимого:
+         name,adapt_ds,adapt_filename,adapt_final_val
+         B/16,cifar100,B_16-i21k-300ep-...--cifar100-steps_10k-lr_0.003-res_224,83.2
+     - Запуск:
+       python3 experiments/vit_pruning/auto_2ssp.py \
+         --use-srp-checkpoint \
+         --srp-model-type B/16 \
+         --srp-dataset cifar100 \
+         --load-cifar --dataset cifar100 \
+         --stage both --target 0.15 \
+         --eval-batches 5
+     - Если .npz не найден локально, будет предпринята загрузка из:
+       https://storage.googleapis.com/vit_models/augreg/<adapt_filename>.npz
+  2) Напрямую по пути к .npz (без index.csv):
+     python3 experiments/vit_pruning/auto_2ssp.py \
+       --use-srp-checkpoint \
+       --srp-checkpoint-npz "pruning_srp-main/models/<имя_чекпоинта>.npz" \
+       --srp-res 224 \
+       --load-cifar --dataset cifar100 \
+       --stage both --target 0.15 \
+       --eval-batches 5
+
+Замечания по SRP режиму:
+- При --use-srp-checkpoint используется timm VisionTransformer, голова уже соответствует числу классов (например, 100 для CIFAR-100).
+- Автоматически отключаются опции изменения головы/адаптера и дообучения: --replace-classifier/--use-adapter/--do-finetune/--freeze-backbone игнорируются.
+- Размер входа (224 или 384) определяется по чекпоинту; пайплайн данных автоматически подстроится под нужное разрешение.
+- В Stage-1 (ширина) используется act_l2 важность; для этого потребуется калибровочный даталоадер (при --load-cifar он есть). Если даталоадер не задан, используйте Stage-2 отдельно: --stage s2 --s2-sparsity ... (в этом случае оценка важности блоков будет по эвристике).

@@ -17,6 +17,14 @@ import torch
 import torch.nn as nn
 
 from transformers import AutoImageProcessor, ViTForImageClassification
+import timm
+import re
+import csv
+from types import SimpleNamespace
+import urllib.request
+import urllib.error
+import subprocess
+import ssl
 
 # Local imports
 import sys
@@ -47,19 +55,29 @@ def pick_device() -> str:
     return "cpu"
 
 
-def measure_latency(model: nn.Module, device: str, warmup: int = 3, iters: int = 10) -> float:
+def measure_latency(model: nn.Module, device: str, warmup: int = 3, iters: int = 10, img_size: int = 224) -> float:
     model.eval()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+    def _fwd(m, x):
+        try:
+            return m(pixel_values=x)
+        except TypeError:
+            try:
+                return m(x)
+            except Exception:
+                return m(x=x) if hasattr(m, "forward") else m(x)
+
     with torch.no_grad():
-        dummy = torch.randn(1, 3, 224, 224, device=device)
+        dummy = torch.randn(1, 3, img_size, img_size, device=device)
         for _ in range(warmup):
-            _ = model(pixel_values=dummy)
+            _ = _fwd(model, dummy)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         start = time.time()
         for _ in range(iters):
-            _ = model(pixel_values=dummy)
+            _ = _fwd(model, dummy)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     return (time.time() - start) / iters  # seconds / image
@@ -109,7 +127,7 @@ def load_cifar10(processor, device: str, train_pct: float = 0.25, test_pct: floa
     return train_loader, test_loader
 
 
-def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 2, num_workers: Optional[int] = None):
+def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 2, num_workers: Optional[int] = None, img_size: int = 224):
     # Lazy imports
     from datasets import load_dataset
     from torchvision import transforms
@@ -133,13 +151,13 @@ def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: floa
 
     normalize = transforms.Normalize(mean=processor.image_mean, std=processor.image_std)
     train_tf = transforms.Compose([
-        transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+        transforms.Resize((img_size, img_size), interpolation=InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         normalize,
     ])
     test_tf = transforms.Compose([
-        transforms.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+        transforms.Resize((img_size, img_size), interpolation=InterpolationMode.BICUBIC),
         transforms.ToTensor(),
         normalize,
     ])
@@ -268,17 +286,166 @@ def save_pruned_model_and_processor(model, processor, out_root: Path, run_id: st
     return out_dir.as_posix()
 
 
+def _select_srp_checkpoint(index_csv_path: str, model_type: str, dataset_name: str) -> tuple[str, int]:
+    rows = []
+    try:
+        with open(index_csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                rows.append(r)
+    except Exception as e:
+        raise FileNotFoundError(f"Failed to read SRP index CSV at {index_csv_path}: {e}")
+
+    cand = [r for r in rows if r.get("name") == model_type and r.get("adapt_ds") == dataset_name and r.get("adapt_filename")]
+    if not cand:
+        raise RuntimeError(f"No SRP checkpoint found in {index_csv_path} for name='{model_type}', adapt_ds='{dataset_name}'")
+
+    def _to_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return float("-inf")
+
+    cand.sort(key=lambda r: _to_float(r.get("adapt_final_val", "-inf")), reverse=True)
+    checkpoint = cand[0]["adapt_filename"]
+    # infer resolution
+    res = 224
+    m = re.search(r"res[_\-]?(\d+)", checkpoint)
+    if m:
+        try:
+            res = int(m.group(1))
+        except Exception:
+            pass
+    return checkpoint, res
+
+
+def _load_srp_model(model_type: str, dataset_name: str, models_dir: str, index_csv_path: Optional[str] = None, checkpoint_npz: Optional[str] = None, verbose: bool = False):
+    timm_modelnames = {
+        "Ti/16-224": "vit_tiny_patch16_224",
+        "Ti/16-384": "vit_tiny_patch16_384",
+        "S/16-224": "vit_small_patch16_224",
+        "S/16-384": "vit_small_patch16_384",
+        "B/16-224": "vit_base_patch16_224",
+        "B/16-384": "vit_base_patch16_384",
+    }
+
+    if checkpoint_npz:
+        checkpoint = os.path.splitext(os.path.basename(checkpoint_npz))[0]
+        res = 224
+        m = re.search(r"res[_\-]?(\d+)", checkpoint)
+        if m:
+            try:
+                res = int(m.group(1))
+            except Exception:
+                pass
+    else:
+        if index_csv_path is None:
+            index_csv_path = os.path.join(models_dir, "index.csv")
+        checkpoint, res = _select_srp_checkpoint(index_csv_path, model_type, dataset_name)
+        checkpoint_npz = os.path.join(models_dir, f"{checkpoint}.npz")
+
+    key = f"{model_type}-{res}"
+    if key not in timm_modelnames:
+        key = f"{model_type}-224"
+    timm_name = timm_modelnames[key]
+
+    num_classes = 100 if dataset_name.lower() == "cifar100" else 37
+    model = timm.create_model(timm_name, num_classes=num_classes)
+
+    if not os.path.isfile(checkpoint_npz):
+        # Try to download from public GCS; multiple fallbacks to avoid local CA issues
+        os.makedirs(models_dir, exist_ok=True)
+        src_url = f"https://storage.googleapis.com/vit_models/augreg/{checkpoint}.npz"
+        print(f"[SRP] Checkpoint not found locally. Attempting download: {src_url}")
+        download_ok = False
+        err_msgs = []
+        # 1) urllib with default SSL
+        try:
+            urllib.request.urlretrieve(src_url, checkpoint_npz)
+            download_ok = True
+            print(f"[SRP] Downloaded to: {checkpoint_npz} (urllib)")
+        except Exception as e1:
+            err_msgs.append(f"urllib default SSL: {e1}")
+        # 2) curl -L (often has proper CA bundle on macOS)
+        if not download_ok:
+            try:
+                subprocess.run(["curl", "-L", src_url, "-o", checkpoint_npz], check=True)
+                download_ok = True
+                print(f"[SRP] Downloaded to: {checkpoint_npz} (curl)")
+            except Exception as e2:
+                err_msgs.append(f"curl: {e2}")
+        # 3) urllib with unverified SSL context (last resort)
+        if not download_ok:
+            try:
+                ctx = ssl._create_unverified_context()
+                with urllib.request.urlopen(src_url, context=ctx) as r, open(checkpoint_npz, "wb") as f:
+                    f.write(r.read())
+                download_ok = True
+                print(f"[SRP] Downloaded to: {checkpoint_npz} (urllib, unverified SSL)")
+            except Exception as e3:
+                err_msgs.append(f"urllib unverified SSL: {e3}")
+        if not download_ok:
+            raise FileNotFoundError(f"SRP checkpoint not found and download failed: {checkpoint_npz}. Tried methods: {' | '.join(err_msgs)}")
+    timm.models.load_checkpoint(model, checkpoint_npz)
+
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    cfg = getattr(model, "default_cfg", {}) or {}
+    mean = cfg.get("mean", [0.5, 0.5, 0.5])
+    std = cfg.get("std", [0.5, 0.5, 0.5])
+    input_size = cfg.get("input_size", (3, res, res))
+    res = int(input_size[-1]) if isinstance(input_size, (list, tuple)) else res
+
+    meta = {
+        "timm_name": timm_name,
+        "checkpoint": checkpoint,
+        "res": res,
+        "mean": mean,
+        "std": std,
+        "num_classes": num_classes,
+        "checkpoint_path": checkpoint_npz,
+    }
+    if verbose:
+        print(f"[SRP] Loaded {timm_name} with checkpoint {checkpoint} ({checkpoint_npz}), res={res}, num_classes={num_classes}")
+    return model, meta
+
+
 def run(args):
     device = pick_device()
     print(f"[INFO] Using device: {device}")
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
 
-    model_name = args.model
-    processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
-    model = ViTForImageClassification.from_pretrained(model_name)
+    # Decide model source: HF or SRP timm checkpoint
+    input_res = 224
+    if getattr(args, "use_srp_checkpoint", False):
+        models_dir = args.srp_models_dir
+        index_csv = args.srp_index_csv
+        srp_ds = getattr(args, "srp_dataset", "cifar100")
+        model, srp_meta = _load_srp_model(
+            model_type=args.srp_model_type,
+            dataset_name=srp_ds,
+            models_dir=models_dir,
+            index_csv_path=index_csv if args.srp_checkpoint_npz is None else None,
+            checkpoint_npz=args.srp_checkpoint_npz,
+            verbose=True,
+        )
+        input_res = int(args.srp_res) if args.srp_res is not None else int(srp_meta["res"])
+        processor = SimpleNamespace(image_mean=srp_meta["mean"], image_std=srp_meta["std"])
+        model_name = f"timm/{srp_meta['timm_name']}@{input_res} (SRP:{srp_meta['checkpoint']})"
+        # Disable head changes and finetuning for SRP models by default
+        args.use_adapter = False
+        args.replace_classifier = False
+        args.freeze_backbone = False
+        args.do_finetune = False
+    else:
+        model_name = args.model
+        processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
+        model = ViTForImageClassification.from_pretrained(model_name)
+        input_res = 224
 
-    hidden = model.config.hidden_size
     # Determine dataset-derived number of labels if CIFAR is requested
     ds_name = None
     expected_num_labels = None
@@ -286,30 +453,33 @@ def run(args):
         ds_name = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
         expected_num_labels = 10 if ds_name == "cifar10" else 100
 
-    # Configure classifier / adapter
-    if getattr(args, "load_adapter", None):
-        model = load_cifar_adapter(args.load_adapter, model)
-        print(f"[INFO] Loaded adapter from: {args.load_adapter} (num_labels={getattr(model.config,'num_labels', None)}, type={model.classifier.__class__.__name__})")
+    if not getattr(args, "use_srp_checkpoint", False):
+        hidden = model.config.hidden_size
+        # Configure classifier / adapter (HF model path)
+        if getattr(args, "load_adapter", None):
+            model = load_cifar_adapter(args.load_adapter, model)
+            print(f"[INFO] Loaded adapter from: {args.load_adapter} (num_labels={getattr(model.config,'num_labels', None)}, type={model.classifier.__class__.__name__})")
+        else:
+            if args.use_adapter:
+                original_out = model.classifier.out_features
+                bottleneck = max(hidden // args.adapter_reduction, 32)
+                model.classifier = nn.Sequential(
+                    nn.Linear(hidden, bottleneck, bias=False),
+                    nn.GELU(),
+                    nn.Linear(bottleneck, original_out, bias=True),
+                )
+                print(f"[INFO] Using adapter head with bottleneck={bottleneck}")
+            elif args.replace_classifier:
+                out_dim = expected_num_labels if expected_num_labels is not None else getattr(model.classifier, "out_features", 10)
+                model.classifier = nn.Linear(hidden, out_dim)
+                model.config.num_labels = out_dim
+                print(f"[INFO] Replaced classifier for {out_dim} classes")
+        if args.freeze_backbone:
+            for p in model.vit.parameters():
+                p.requires_grad = False
+            print("[INFO] Backbone frozen; training head-only")
     else:
-        if args.use_adapter:
-            original_out = model.classifier.out_features
-            bottleneck = max(hidden // args.adapter_reduction, 32)
-            model.classifier = nn.Sequential(
-                nn.Linear(hidden, bottleneck, bias=False),
-                nn.GELU(),
-                nn.Linear(bottleneck, original_out, bias=True),
-            )
-            print(f"[INFO] Using adapter head with bottleneck={bottleneck}")
-        elif args.replace_classifier:
-            out_dim = expected_num_labels if expected_num_labels is not None else getattr(model.classifier, "out_features", 10)
-            model.classifier = nn.Linear(hidden, out_dim)
-            model.config.num_labels = out_dim
-            print(f"[INFO] Replaced classifier for {out_dim} classes")
-
-    if args.freeze_backbone:
-        for p in model.vit.parameters():
-            p.requires_grad = False
-        print("[INFO] Backbone frozen; training head-only")
+        print("[INFO] Using SRP timm checkpoint; skipping head/adapter changes and backbone freezing.")
 
     model.to(device)
 
@@ -322,6 +492,7 @@ def run(args):
             train_pct=args.cifar_train_pct,
             test_pct=args.cifar_test_pct,
             calib_per_class=getattr(args, "calib_per_class", 2),
+            img_size=input_res,
         )
     else:
         train_loader = test_loader = cal_loader = None
@@ -332,7 +503,7 @@ def run(args):
 
     # Baseline metrics
     params_before = count_total_params(model)
-    latency_baseline = measure_latency(model, device, warmup=3, iters=10)
+    latency_baseline = measure_latency(model, device, warmup=3, iters=10, img_size=input_res)
     if test_loader is not None:
         acc_baseline = evaluate_top1(model, test_loader, device=device, max_batches=args.eval_batches, progress=True)
     else:
@@ -351,7 +522,13 @@ def run(args):
         plan = None
 
     # Stage-1: width pruning
-    B = len(_get_encoder(model).layer)
+    enc = _get_encoder(model)
+    if hasattr(enc, "layer"):
+        B = len(enc.layer)
+    elif hasattr(enc, "blocks"):
+        B = len(enc.blocks)
+    else:
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
     ffn_masks = None
     ffn_indices = None
 
@@ -397,7 +574,7 @@ def run(args):
         pass
 
     params_after_stage1 = count_total_params(model) if args.stage != "s2" else params_before
-    latency_stage1 = measure_latency(model, device, warmup=3, iters=10)
+    latency_stage1 = measure_latency(model, device, warmup=3, iters=10, img_size=input_res)
     if test_loader is not None:
         acc_stage1 = evaluate_top1(model, test_loader, device=device, max_batches=args.eval_batches, progress=False)
     else:
@@ -438,7 +615,7 @@ def run(args):
         pass
 
     params_after_stage2 = count_total_params(model)
-    latency_stage2 = measure_latency(model, device, warmup=3, iters=10)
+    latency_stage2 = measure_latency(model, device, warmup=3, iters=10, img_size=input_res)
     if test_loader is not None:
         acc_stage2 = evaluate_top1(model, test_loader, device=device, max_batches=args.eval_batches, progress=False)
     else:
@@ -452,12 +629,27 @@ def run(args):
     # Optional: persist pruned model (user-controlled)
     pruned_model_dir = None
     if args.save_pruned_model:
-        pruned_model_dir = save_pruned_model_and_processor(
-            model,
-            processor,
-            Path(args.pruned_output_dir),
-            run_id,
-        )
+        if getattr(args, "use_srp_checkpoint", False):
+            # Save timm state dict and SRP meta
+            pruned_dir = Path(args.pruned_output_dir) / run_id
+            pruned_dir.mkdir(parents=True, exist_ok=True)
+            sd_path = pruned_dir / "timm_model.pth"
+            torch.save(model.state_dict(), sd_path.as_posix())
+            meta = {}
+            try:
+                meta = srp_meta  # available when SRP branch was taken
+            except NameError:
+                meta = {}
+            with open(pruned_dir / "srp_meta.json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+            pruned_model_dir = pruned_dir.as_posix()
+        else:
+            pruned_model_dir = save_pruned_model_and_processor(
+                model,
+                processor,
+                Path(args.pruned_output_dir),
+                run_id,
+            )
 
     # Save artifacts and report
     reports_dir = Path(__file__).resolve().parent / "reports"
@@ -518,7 +710,7 @@ def run(args):
             "est_error_params": plan.est_error_params,
         }
 
-    if args.save_adapter:
+    if args.save_adapter and not getattr(args, "use_srp_checkpoint", False):
         adapter_path = save_cifar_adapter(
             model,
             out_dir=str(artifacts_dir),
@@ -611,6 +803,14 @@ def build_argparser():
     p.add_argument("--save-adapter", action="store_true", help="Save adapter/classifier state dict")
     p.add_argument("--eval-batches", type=int, default=5, help="Max batches to use for quick evaluation")
     p.add_argument("--load-adapter", type=str, default=None, help="Path to saved adapter.pt to load into model classifier")
+    # SRP/timm checkpoint options
+    p.add_argument("--use-srp-checkpoint", action="store_true", help="Load SRP timm checkpoint via models/index.csv instead of HF model")
+    p.add_argument("--srp-model-type", type=str, default="B/16", help="SRP model type: Ti/16, S/16, or B/16")
+    p.add_argument("--srp-dataset", type=str, default="cifar100", choices=["cifar100", "oxford-iiit-pet"], help="Dataset used for SRP fine-tuning to pick checkpoint from index.csv")
+    p.add_argument("--srp-index-csv", type=str, default=str(ROOT / "pruning_srp-main" / "models" / "index.csv"), help="Path to SRP models/index.csv")
+    p.add_argument("--srp-models-dir", type=str, default=str(ROOT / "pruning_srp-main" / "models"), help="Directory containing SRP .npz checkpoints")
+    p.add_argument("--srp-checkpoint-npz", type=str, default=None, help="Direct path to SRP .npz checkpoint to load (bypass index.csv)")
+    p.add_argument("--srp-res", type=int, default=None, help="Force input resolution (e.g. 224 or 384) for SRP model")
     p.add_argument(
         "--depth-importance",
         type=str,

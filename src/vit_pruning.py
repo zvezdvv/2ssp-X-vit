@@ -48,14 +48,22 @@ def _get_encoder(vit_model):
 def _gather_mlp_pairs(vit_model) -> List[Tuple[nn.Linear, nn.Linear]]:
     """Return (intermediate_dense, output_dense) linear layer pairs for each ViT encoder block.
 
-    Supports huggingface ViTModel / ViTForImageClassification structures.
+    Supports huggingface ViTModel / ViTForImageClassification and timm VisionTransformer structures.
     """
     mlp_pairs = []
     encoder = _get_encoder(vit_model)
-    for layer in encoder.layer:  # type: ignore[attr-defined]
-        inter_dense = layer.intermediate.dense
-        out_dense = layer.output.dense
-        mlp_pairs.append((inter_dense, out_dense))
+    if hasattr(encoder, "layer"):
+        for layer in encoder.layer:  # type: ignore[attr-defined]
+            inter_dense = layer.intermediate.dense
+            out_dense = layer.output.dense
+            mlp_pairs.append((inter_dense, out_dense))
+    elif hasattr(encoder, "blocks"):
+        for block in encoder.blocks:  # timm VisionTransformer
+            inter_dense = block.mlp.fc1
+            out_dense = block.mlp.fc2
+            mlp_pairs.append((inter_dense, out_dense))
+    else:
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
     return mlp_pairs
 
 @torch.no_grad()
@@ -76,11 +84,17 @@ def count_total_params(model: nn.Module) -> int:
 
 @torch.no_grad()
 def count_block_params(model: nn.Module) -> List[int]:
-    """Return per-block parameter counts for encoder.layer[i]."""
+    """Return per-block parameter counts for encoder blocks."""
     encoder = _get_encoder(model)
     counts = []
-    for layer in encoder.layer:  # type: ignore[attr-defined]
-        counts.append(sum(p.numel() for p in layer.parameters()))
+    if hasattr(encoder, "layer"):
+        for layer in encoder.layer:  # type: ignore[attr-defined]
+            counts.append(sum(p.numel() for p in layer.parameters()))
+    elif hasattr(encoder, "blocks"):
+        for block in encoder.blocks:  # timm VisionTransformer
+            counts.append(sum(p.numel() for p in block.parameters()))
+    else:
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
     return counts
 
 @torch.no_grad()
@@ -110,7 +124,18 @@ def _compute_ffn_activation_importance(
     """
     vit_model.eval()
     encoder = _get_encoder(vit_model)
-    B = len(encoder.layer)
+    if hasattr(encoder, "layer"):
+        layers = encoder.layer
+        B = len(layers)
+        def _get_intermediate_module(i): return layers[i].intermediate
+        def _get_d_int(i): return layers[i].intermediate.dense.out_features
+    elif hasattr(encoder, "blocks"):
+        layers = encoder.blocks
+        B = len(layers)
+        def _get_intermediate_module(i): return layers[i].mlp.fc1
+        def _get_d_int(i): return layers[i].mlp.fc1.out_features
+    else:
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
 
     sums: List[Optional[torch.Tensor]] = [None for _ in range(B)]
     counts = 0
@@ -135,7 +160,7 @@ def _compute_ffn_activation_importance(
     handles = []
     try:
         for b in range(B):
-            handles.append(encoder.layer[b].intermediate.register_forward_hook(make_hook(b)))
+            handles.append(_get_intermediate_module(b).register_forward_hook(make_hook(b)))
 
         iterator = dataloader
         if progress:
@@ -151,7 +176,13 @@ def _compute_ffn_activation_importance(
                 break
             px = batch["pixel_values"].to(device, non_blocking=True)
             with torch.autocast(device_type=autocast_dev, enabled=True):
-                _ = vit_model(pixel_values=px)
+                try:
+                    _ = vit_model(pixel_values=px)
+                except TypeError:
+                    try:
+                        _ = vit_model(px)
+                    except Exception:
+                        _ = vit_model(x=px)
             counts += px.size(0)
     finally:
         for h in handles:
@@ -162,7 +193,7 @@ def _compute_ffn_activation_importance(
 
     imps: List[torch.Tensor] = []
     for b in range(B):
-        d_int = encoder.layer[b].intermediate.dense.out_features
+        d_int = _get_d_int(b)
         if sums[b] is None:
             imps.append(torch.zeros(d_int))
         else:
@@ -311,8 +342,23 @@ def evaluate_top1(model, dataloader, device: str = "cuda", max_batches: int | No
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
         with torch.autocast(device_type=autocast_device, enabled=True):
-            out = model(pixel_values=pixel_values)
-            logits = out.logits
+            try:
+                out = model(pixel_values=pixel_values)
+            except TypeError:
+                # Fallback for timm models that accept tensor as positional arg
+                try:
+                    out = model(pixel_values)
+                except Exception:
+                    out = model(x=pixel_values) if hasattr(model, "forward") else model(pixel_values)
+            # Normalize outputs to logits tensor
+            if isinstance(out, torch.Tensor):
+                logits = out
+            elif hasattr(out, "logits"):
+                logits = out.logits
+            elif isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
+                logits = out[0]
+            else:
+                raise RuntimeError("Model forward output is not a tensor or does not contain logits")
         preds = logits.argmax(dim=-1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
@@ -358,7 +404,7 @@ def prune_vit_attention_blocks(
     """
     assert 0.0 <= sparsity < 1.0, "sparsity must be in [0,1)"
 
-    class AttentionBypass(nn.Module):
+    class HFAttentionBypass(nn.Module):
         def __init__(self):
             super().__init__()
         def forward(self, hidden_states, head_mask=None, output_attentions: bool = False, *args, **kwargs):
@@ -367,9 +413,20 @@ def prune_vit_attention_blocks(
                 return (zeros, None)
             return (zeros,)
 
+    class TimmAttentionBypass(nn.Module):
+        def __init__(self):
+            super().__init__()
+        def forward(self, x, *args, **kwargs):
+            return torch.zeros_like(x)
+
     vit_model.eval()
     encoder = _get_encoder(vit_model)
-    num_blocks = len(encoder.layer)
+    if hasattr(encoder, "layer"):
+        num_blocks = len(encoder.layer)
+    elif hasattr(encoder, "blocks"):
+        num_blocks = len(encoder.blocks)
+    else:
+        num_blocks = 0
 
     # Determine how many blocks to modify
     if num_to_prune is None:
@@ -407,8 +464,10 @@ def prune_vit_attention_blocks(
                 model_copy = copy.deepcopy(vit_model)
                 model_copy.eval()
                 enc_copy = _get_encoder(model_copy)
-                if hasattr(enc_copy.layer[block_idx], "attention"):
-                    enc_copy.layer[block_idx].attention = AttentionBypass()
+                if hasattr(enc_copy, "layer") and hasattr(enc_copy.layer[block_idx], "attention"):
+                    enc_copy.layer[block_idx].attention = HFAttentionBypass()
+                elif hasattr(enc_copy, "blocks") and hasattr(enc_copy.blocks[block_idx], "attn"):
+                    enc_copy.blocks[block_idx].attn = TimmAttentionBypass()
 
                 score = evaluate_top1(model_copy, dataloader, device, max_batches=batch_limit, progress=False)
                 impact = max(0.0, original_metrics - score)
@@ -424,8 +483,10 @@ def prune_vit_attention_blocks(
 
     # Apply pruning on the original model: replace attention with bypass
     for idx in to_prune:
-        if hasattr(encoder.layer[idx], "attention"):
-            encoder.layer[idx].attention = AttentionBypass()
+        if hasattr(encoder, "layer") and hasattr(encoder.layer[idx], "attention"):
+            encoder.layer[idx].attention = HFAttentionBypass()
+        elif hasattr(encoder, "blocks") and hasattr(encoder.blocks[idx], "attn"):
+            encoder.blocks[idx].attn = TimmAttentionBypass()
 
     # Optional evaluation after pruning
     if dataloader is not None:
@@ -448,12 +509,16 @@ def _count_attention_params_per_block(vit_model) -> List[int]:
     """Return per-block parameter counts for the attention submodule only (encoder.layer[i].attention)."""
     encoder = _get_encoder(vit_model)
     counts: List[int] = []
-    for layer in encoder.layer:  # type: ignore[attr-defined]
-        attn = getattr(layer, "attention", None)
-        if attn is None:
-            counts.append(0)
-        else:
-            counts.append(sum(p.numel() for p in attn.parameters()))
+    if hasattr(encoder, "layer"):
+        for layer in encoder.layer:  # type: ignore[attr-defined]
+            attn = getattr(layer, "attention", None)
+            counts.append(0 if attn is None else sum(p.numel() for p in attn.parameters()))
+    elif hasattr(encoder, "blocks"):
+        for block in encoder.blocks:  # timm VisionTransformer
+            attn = getattr(block, "attn", None)
+            counts.append(0 if attn is None else sum(p.numel() for p in attn.parameters()))
+    else:
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
     return counts
 
 @torch.no_grad()
@@ -461,11 +526,20 @@ def _count_ffn_params_per_block(vit_model) -> List[int]:
     """Return per-block parameter counts for the FFN submodules (intermediate.dense + output.dense)."""
     encoder = _get_encoder(vit_model)
     counts: List[int] = []
-    for layer in encoder.layer:  # type: ignore[attr-defined]
-        inter = layer.intermediate.dense
-        out = layer.output.dense
-        cnt = sum(p.numel() for p in inter.parameters()) + sum(p.numel() for p in out.parameters())
-        counts.append(cnt)
+    if hasattr(encoder, "layer"):
+        for layer in encoder.layer:  # type: ignore[attr-defined]
+            inter = layer.intermediate.dense
+            out = layer.output.dense
+            cnt = sum(p.numel() for p in inter.parameters()) + sum(p.numel() for p in out.parameters())
+            counts.append(cnt)
+    elif hasattr(encoder, "blocks"):
+        for block in encoder.blocks:  # timm VisionTransformer
+            inter = block.mlp.fc1
+            out = block.mlp.fc2
+            cnt = sum(p.numel() for p in inter.parameters()) + sum(p.numel() for p in out.parameters())
+            counts.append(cnt)
+    else:
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
     return counts
 
 # ==================================
