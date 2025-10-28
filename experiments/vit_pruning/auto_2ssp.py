@@ -511,7 +511,7 @@ def run(args):
         args.use_adapter = False
         args.replace_classifier = False
         args.freeze_backbone = False
-        args.do_finetune = Falseё
+        args.do_finetune = False
     else:
         model_name = args.model
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
