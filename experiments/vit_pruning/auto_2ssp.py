@@ -410,7 +410,74 @@ def _load_srp_model(model_type: str, dataset_name: str, models_dir: str, index_c
     if verbose:
         print(f"[SRP] Loaded {timm_name} with checkpoint {checkpoint} ({checkpoint_npz}), res={res}, num_classes={num_classes}")
     return model, meta
+def timm2transformers(tf_model, timm_model):
+    tf_model.vit.embeddings.cls_token = timm_model.cls_token
+    tf_model.vit.embeddings.position_embeddings = timm_model.pos_embed
+    tf_model.vit.embeddings.patch_embeddings.projection = timm_model.patch_embed.proj
+    for i in range(12):
+        tf_model.vit.encoder.layer[i].attention.attention.query.weight = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.weight[:768])
+        tf_model.vit.encoder.layer[i].attention.attention.key.weight = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.weight[768:768*2])
+        tf_model.vit.encoder.layer[i].attention.attention.value.weight = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.weight[768*2:768*3])
+        tf_model.vit.encoder.layer[i].attention.attention.query.bias = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.bias[:768])
+        tf_model.vit.encoder.layer[i].attention.attention.key.bias = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.bias[768:768*2])
+        tf_model.vit.encoder.layer[i].attention.attention.value.bias = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.bias[768*2:768*3])
+        tf_model.vit.encoder.layer[i].attention.output.dense = timm_model.blocks[i].attn.proj
+        tf_model.vit.encoder.layer[i].intermediate.dense = timm_model.blocks[i].mlp.fc1
+        tf_model.vit.encoder.layer[i].output.dense = timm_model.blocks[i].mlp.fc2
+        tf_model.vit.encoder.layer[i].layernorm_before = timm_model.blocks[i].norm1
+        tf_model.vit.encoder.layer[i].layernorm_after = timm_model.blocks[i].norm2
+    tf_model.vit.layernorm = timm_model.norm
+    tf_model.classifier = timm_model.head
 
+    return tf_model
+def load_model_timm(model_type, dataset_name, verbose=False):
+    """ 
+    model   types: B/16, S/16 or Ti/16
+    dataset names: cifar100 or oxford-iiit-pet
+    """
+    import pandas as pd
+    index = pd.read_csv('experiments/vit_pruning/models/index.csv')
+    pretrains = set(
+        index.query('ds=="i21k"').groupby('name').apply(
+        lambda df: df.sort_values('final_val').iloc[-1], 
+        include_groups=False).filename
+    )
+    finetunes = index.loc[index.filename.apply(lambda name: name in pretrains)]
+    checkpoint = (
+        finetunes.query(f'name=="{model_type}" and adapt_ds=="{dataset_name}"')
+        .sort_values('adapt_final_val').iloc[-1].adapt_filename
+    ) # Ti_16-i21k-300ep-lr_0.001-aug_none-wd_0.03-do_0.0-sd_0.0--cifar100-steps_10k-lr_0.003-res_224
+    if verbose: print(f"Loaded checkpoint: {checkpoint}")
+    
+    timm_modelnames = {
+        'Ti/16-224': 'vit_tiny_patch16_224',
+        'Ti/16-384': 'vit_tiny_patch16_384',
+        'S/16-224': 'vit_small_patch16_224',
+        'S/16-384': 'vit_small_patch16_384',
+        'B/16-224': 'vit_base_patch16_224',
+        'B/16-384': 'vit_base_patch16_384'
+    }
+    num_classes = 100 if dataset_name == 'cifar100' else 37
+    res = int(checkpoint.split('_')[-1])
+    model = timm.create_model(timm_modelnames[f'{model_type}-{res}'], num_classes=num_classes)
+    
+    # downloading a checkpoint automatically
+    # may show an error, but still downloads the checkpoint
+    from tensorflow.io import gfile # type: ignore
+    if not gfile.exists(f'experiments/vit_pruning/models/{checkpoint}.npz'):     
+        gfile.copy(f'gs://vit_models/augreg/{checkpoint}.npz', f'experiments/vit_pruning/models/{checkpoint}.npz')
+    timm.models.load_checkpoint(model, f'experiments/vit_pruning/models/{checkpoint}.npz')
+
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available() else (
+        "cuda" if torch.cuda.is_available() else
+        "cpu"
+    ))
+    model.to(device)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
 
 def run(args):
     device = pick_device()
@@ -421,25 +488,30 @@ def run(args):
     # Decide model source: HF or SRP timm checkpoint
     input_res = 224
     if getattr(args, "use_srp_checkpoint", False):
-        models_dir = args.srp_models_dir
-        index_csv = args.srp_index_csv
-        srp_ds = getattr(args, "srp_dataset", "cifar100")
-        model, srp_meta = _load_srp_model(
-            model_type=args.srp_model_type,
-            dataset_name=srp_ds,
-            models_dir=models_dir,
-            index_csv_path=index_csv if args.srp_checkpoint_npz is None else None,
-            checkpoint_npz=args.srp_checkpoint_npz,
-            verbose=True,
-        )
-        input_res = int(args.srp_res) if args.srp_res is not None else int(srp_meta["res"])
-        processor = SimpleNamespace(image_mean=srp_meta["mean"], image_std=srp_meta["std"])
-        model_name = f"timm/{srp_meta['timm_name']}@{input_res} (SRP:{srp_meta['checkpoint']})"
+        model_name = args.model
+        processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
+        model = ViTForImageClassification.from_pretrained(model_name)
+        model = timm2transformers(model, load_model_timm('B/16', 'cifar100'))
+        input_res = 224
+        # models_dir = args.srp_models_dir
+        # index_csv = args.srp_index_csv
+        # srp_ds = getattr(args, "srp_dataset", "cifar100")
+        # model, srp_meta = _load_srp_model(
+        #     model_type=args.srp_model_type,
+        #     dataset_name=srp_ds,
+        #     models_dir=models_dir,
+        #     index_csv_path=index_csv if args.srp_checkpoint_npz is None else None,
+        #     checkpoint_npz=args.srp_checkpoint_npz,
+        #     verbose=True,
+        # )
+        # input_res = int(args.srp_res) if args.srp_res is not None else int(srp_meta["res"])
+        # processor = SimpleNamespace(image_mean=srp_meta["mean"], image_std=srp_meta["std"])
+        # model_name = f"timm/{srp_meta['timm_name']}@{input_res} (SRP:{srp_meta['checkpoint']})"
         # Disable head changes and finetuning for SRP models by default
         args.use_adapter = False
         args.replace_classifier = False
         args.freeze_backbone = False
-        args.do_finetune = False
+        args.do_finetune = Falseё
     else:
         model_name = args.model
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
