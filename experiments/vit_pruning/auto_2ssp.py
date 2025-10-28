@@ -3,9 +3,11 @@
 """python3 experiments/vit_pruning/auto_2ssp.py --target 0.1 --load-cifar --cifar-train-pct 0.4 --cifar-test-pct 0.2 --load-adapter experiments/vit_pruning/artifacts/20250923-213804/adapter.pt --freeze-backbone --depth-importance copy --eval-batches 5 --force-depth-blocks 1"""
 """python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.15 --load-cifar --cifar-train-pct 0.4 --cifar-test-pct 0.2 --load-adapter experiments/vit_pruning/artifacts/20250923-213804/adapter.pt --eval-batches 5"""
 """first run (no adapter yet): python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.0 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --replace-classifier --freeze-backbone --do-finetune --ft-epochs 2 --ft-lr 5e-5 --save-adapter --eval-batches 5"""
-"""CIFAR100: python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.15 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --load-adapter experiments/vit_pruning/artifacts/20251024-215318/adapter.pt --eval-batches 5"""
+"""CIFAR100: python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.2 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --load-adapter experiments/vit_pruning/artifacts/20251024-215318/adapter.pt --eval-batches 5"""
 """CIFAR100: python3 experiments/vit_pruning/auto_2ssp.py --stage s2 --s2-sparsity 0.05 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --load-adapter experiments/vit_pruning/artifacts/20251024-215318/adapter.pt --eval-batches 5"""
 
+
+"""python3 experiments/vit_pruning/auto_2ssp.py --use-srp-checkpoint --srp-model-type B/16 --srp-dataset cifar100 --load-cifar --dataset cifar100 --stage s2 --s2-sparsity 0.25 --eval-batches 5"""
 import argparse
 import os
 import time

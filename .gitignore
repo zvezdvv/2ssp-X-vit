@@ -167,3 +167,5 @@ reports/
 *.json
 
 *.npz
+
+*.txt
