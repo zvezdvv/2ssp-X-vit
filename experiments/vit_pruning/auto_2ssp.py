@@ -416,20 +416,28 @@ def timm2transformers(tf_model, timm_model):
     tf_model.vit.embeddings.cls_token = timm_model.cls_token
     tf_model.vit.embeddings.position_embeddings = timm_model.pos_embed
     tf_model.vit.embeddings.patch_embeddings.projection = timm_model.patch_embed.proj
-    for i in range(12):
-        tf_model.vit.encoder.layer[i].attention.attention.query.weight = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.weight[:768])
-        tf_model.vit.encoder.layer[i].attention.attention.key.weight = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.weight[768:768*2])
-        tf_model.vit.encoder.layer[i].attention.attention.value.weight = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.weight[768*2:768*3])
-        tf_model.vit.encoder.layer[i].attention.attention.query.bias = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.bias[:768])
-        tf_model.vit.encoder.layer[i].attention.attention.key.bias = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.bias[768:768*2])
-        tf_model.vit.encoder.layer[i].attention.attention.value.bias = torch.nn.Parameter(timm_model.blocks[i].attn.qkv.bias[768*2:768*3])
-        tf_model.vit.encoder.layer[i].attention.output.dense = timm_model.blocks[i].attn.proj
-        tf_model.vit.encoder.layer[i].intermediate.dense = timm_model.blocks[i].mlp.fc1
-        tf_model.vit.encoder.layer[i].output.dense = timm_model.blocks[i].mlp.fc2
-        tf_model.vit.encoder.layer[i].layernorm_before = timm_model.blocks[i].norm1
-        tf_model.vit.encoder.layer[i].layernorm_after = timm_model.blocks[i].norm2
+    
+    sd = {}
+    for m1, m2 in zip(tf_model.vit.encoder.layer, timm_model.blocks):
+        sd['weight'], sd['bias'] = m2.attn.qkv.weight[:768], m2.attn.qkv.bias[:768]
+        m1.attention.attention.query.load_state_dict(sd)
+        sd['weight'], sd['bias'] = m2.attn.qkv.weight[768:768*2], m2.attn.qkv.bias[768:768*2]
+        m1.attention.attention.key.load_state_dict(sd)
+        sd['weight'], sd['bias'] = m2.attn.qkv.weight[768*2:768*3], m2.attn.qkv.bias[768*2:768*3]
+        m1.attention.attention.value.load_state_dict(sd)
+        sd['weight'], sd['bias'] = m2.attn.proj.weight, m2.attn.proj.bias
+        m1.attention.output.dense.load_state_dict(sd)
+        sd['weight'], sd['bias'] = m2.mlp.fc1.weight, m2.mlp.fc1.bias
+        m1.intermediate.dense.load_state_dict(sd)
+        sd['weight'], sd['bias'] = m2.mlp.fc2.weight, m2.mlp.fc2.bias
+        m1.output.dense.load_state_dict(sd)
+        
+        m1.layernorm_before = m2.norm1
+        m1.layernorm_after = m2.norm2
+    
     tf_model.vit.layernorm = timm_model.norm
-    tf_model.classifier = timm_model.head
+    sd['weight'], sd['bias'] = timm_model.head.weight, timm_model.head.bias
+    tf_model.classifier.load_state_dict(sd)
 
     return tf_model
 def load_model_timm(model_type, dataset_name, verbose=False):
