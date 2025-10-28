@@ -501,6 +501,7 @@ def run(args):
         model_name = args.model
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
         model = ViTForImageClassification.from_pretrained(model_name)
+        model.classifier = torch.nn.Linear(768, 100, device=device)
         model = timm2transformers(model, load_model_timm('B/16', 'cifar100'))
         input_res = 224
         # models_dir = args.srp_models_dir
