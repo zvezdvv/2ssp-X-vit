@@ -8,6 +8,13 @@
 
 
 """python3 experiments/vit_pruning/auto_2ssp.py --use-srp-checkpoint --srp-model-type B/16 --srp-dataset cifar100 --load-cifar --dataset cifar100 --stage s2 --s2-sparsity 0.25 --eval-batches 5"""
+"""Timm checkpoint, cifar100: python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.45 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --eval-batches 5 --use-srp-checkpoint"""
+"""python3 experiments/vit_pruning/auto_2ssp.py --stage s1 --s1-sparsity 0.45 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --eval-batches 5 --use-srp-checkpoint"""
+
+"""python3 experiments/vit_pruning/auto_2ssp.py --stage s2 --s2-sparsity 0.05 --force-depth-blocks 1 --load-cifar --dataset cifar100 --cifar-train-pct 0.4 --cifar-test-pct 0.2 --calib-per-class 2 --eval-batches 5 --use-srp-checkpoint"""
+"""--target 0.05 --force-depth-blocks 5"""
+
+
 import argparse
 import os
 import time
