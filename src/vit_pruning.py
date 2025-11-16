@@ -212,6 +212,7 @@ def prune_vit_mlp_width(
     batch_limit: Optional[int] = None,
     progress: bool = False,
     collect_masks: bool = False,
+    precomputed_importance: Optional[List[torch.Tensor]] = None,
 ):
     """Width pruning of MLP intermediate dimension across all ViT blocks.
 
@@ -237,8 +238,13 @@ def prune_vit_mlp_width(
             raise AssertionError("sparsity must be in [0,1)")
 
     # Activation-based importance (paper S1): average L2 of activations over tokens and calibration samples
+    # Or use external precomputed importance per block (List[Tensor[d_int]])
     importance_blocks: Optional[List[torch.Tensor]] = None
-    if strategy == "act_l2" and dataloader is not None:
+    if precomputed_importance is not None:
+        if len(precomputed_importance) != len(mlp_pairs):
+            raise ValueError("precomputed_importance length must match number of blocks")
+        importance_blocks = precomputed_importance
+    elif strategy == "act_l2" and dataloader is not None:
         print("[S1-LOG] Using activation-based importance (avg L2 over tokens, averaged across calibration samples)")
         importance_blocks = _compute_ffn_activation_importance(
             vit_model, dataloader, device=device, batch_limit=batch_limit, progress=progress
@@ -253,12 +259,14 @@ def prune_vit_mlp_width(
         W_out: torch.Tensor = out_dense.weight    # [hidden, intermediate]
         n_channels = W_int.size(0)
 
-        if strategy == "act_l2" and importance_blocks is not None:
+        if importance_blocks is not None:
             importance = importance_blocks[block_idx].to(W_int.device)
             if importance.numel() != n_channels:
-                raise RuntimeError("act_l2 importance size mismatch with intermediate width")
+                raise RuntimeError("precomputed/act_l2 importance size mismatch with intermediate width")
         elif strategy == "l1":
             importance = W_int.abs().sum(dim=1)
+        elif strategy == "act_l2":
+            raise RuntimeError("act_l2 importance requested but no dataloader/importance available")
         else:
             raise ValueError(f"Unknown strategy {strategy}")
 
@@ -379,6 +387,7 @@ def prune_vit_attention_blocks(
     importance_mode: str = "copy",
     show_progress: bool = True,
     num_to_prune: Optional[int] = None,
+    selected_indices: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Prune attention submodules only in selected blocks (Stage-2 of 2SSP).
 
@@ -438,8 +447,14 @@ def prune_vit_attention_blocks(
         print("No attention submodules to prune (num_to_prune=0).")
         return {"model": vit_model, "pruned_indices": [], "original_metrics": None, "final_metrics": None}
 
-    # Importance selection
-    if dataloader is None or (isinstance(importance_mode, str) and importance_mode.lower() == "heuristic"):
+    # Importance selection or use provided indices
+    if selected_indices is not None:
+        to_prune = sorted(set([i for i in selected_indices if 0 <= i < num_blocks]))
+        if num_to_prune is not None:
+            to_prune = to_prune[:num_to_prune]
+        original_metrics = None
+        final_metrics = None
+    elif dataloader is None or (isinstance(importance_mode, str) and importance_mode.lower() == "heuristic"):
         print("Using heuristic for attention pruning importance (position-based).")
         importance_scores = [(i if i < num_blocks / 2 else num_blocks - i) for i in range(num_blocks)]
         to_prune = sorted(range(num_blocks), key=lambda i: importance_scores[i])[:num_to_prune]

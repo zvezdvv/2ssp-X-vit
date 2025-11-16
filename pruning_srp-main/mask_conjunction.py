@@ -233,6 +233,134 @@ class BlockPruning:
     pass
 
 
+class Auto2SSPInterface(PruningInterface):
+    def __init__(self, model, pruning_dataloader, device=None, importance_mode="copy", batch_limit=5, min_remaining=256, error_policy="raise"):
+        super().__init__(model, pruning_dataloader)
+        # Declare pruning capabilities of the method
+        self.att_prune_type = PruningTypes.DEPTH
+        self.mlp_prune_type = PruningTypes.WIDTH
+
+        self.device = device or ("cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu"))
+        self.importance_mode = importance_mode
+        self.batch_limit = batch_limit
+        self.min_remaining = min_remaining
+        # How to handle evaluation errors in 'copy' mode: 'raise' (default) or 'heuristic'
+        self.error_policy = error_policy
+
+        # Make project root importable and cache references to helpers from src.vit_pruning
+        import sys
+        from pathlib import Path
+        ROOT = Path(__file__).resolve().parents[1]
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from src.vit_pruning import _get_encoder, evaluate_top1, _gather_mlp_pairs
+        self._get_encoder = _get_encoder
+        self._evaluate_top1 = evaluate_top1
+        self._gather_mlp_pairs = _gather_mlp_pairs
+
+        # Optional: activation-driven FFN importance (may be unavailable)
+        try:
+            from src.vit_pruning import _compute_ffn_activation_importance
+            self._compute_ffn_activation_importance = _compute_ffn_activation_importance
+        except Exception:
+            self._compute_ffn_activation_importance = None
+
+    def _num_blocks(self):
+        enc = self._get_encoder(self.nn)
+        if hasattr(enc, "layer"):
+            return len(enc.layer)
+        if hasattr(enc, "blocks"):
+            return len(enc.blocks)
+        raise AttributeError("Unsupported ViT model structure: expected encoder.layer or blocks")
+
+    def _compute_mlp_importance(self):
+        # Prefer calibration-driven activation L2 metric if dataloader provided
+        if self.dl is not None and self._compute_ffn_activation_importance is not None:
+            try:
+                imps = self._compute_ffn_activation_importance(
+                    self.nn, self.dl, device=self.device, batch_limit=self.batch_limit, progress=False
+                )
+                if isinstance(imps, list) and len(imps) > 0:
+                    # List[Tensor[d_int]] per block
+                    return [t.detach().to("cpu") for t in imps]
+            except Exception:
+                pass  # fallback to weight L1
+
+        # Fallback: per-neuron L1 norm of fc1 weights
+        pairs = self._gather_mlp_pairs(self.nn)
+        out = []
+        for inter_dense, _ in pairs:
+            W_int = inter_dense.weight  # [intermediate, hidden]
+            imp = W_int.abs().sum(dim=1).detach().to("cpu")
+            out.append(imp)
+        return out
+
+    def _compute_att_depth_importance(self):
+        B = self._num_blocks()
+        # Heuristic if no dataloader or requested explicitly
+        if self.importance_mode.lower() == "heuristic" or self.dl is None:
+            # center-most blocks get highest importance; edges lowest
+            scores = [(i if i < B/2 else B - i) for i in range(B)]
+            return torch.tensor(scores, dtype=torch.float32)
+
+        # Copy-replace evaluation impact
+        import copy
+        import torch.nn as nn
+
+        class HFAttentionBypass(nn.Module):
+            def __init__(self):
+                super().__init__()
+            def forward(self, hidden_states, head_mask=None, output_attentions: bool = False, *args, **kwargs):
+                zeros = torch.zeros_like(hidden_states)
+                if output_attentions:
+                    return (zeros, None)
+                return (zeros,)
+
+        class TimmAttentionBypass(nn.Module):
+            def __init__(self):
+                super().__init__()
+            def forward(self, x, *args, **kwargs):
+                return torch.zeros_like(x)
+
+        heuristic_scores = [(i if i < B/2 else B - i) for i in range(B)]
+
+        # Baseline accuracy
+        try:
+            baseline = float(self._evaluate_top1(self.nn, self.dl, device=self.device, max_batches=self.batch_limit, progress=False))
+        except Exception as e:
+            if getattr(self, "error_policy", "raise") == "raise":
+                raise e
+            else:
+                # Fallback to heuristic for all blocks to avoid mixing incomparable scales
+                return torch.tensor(heuristic_scores, dtype=torch.float32)
+
+        enc = self._get_encoder(self.nn)
+        impacts = []
+        for i in range(B):
+            try:
+                mcopy = copy.deepcopy(self.nn)
+                enc_copy = self._get_encoder(mcopy)
+                if hasattr(enc_copy, "layer") and hasattr(enc_copy.layer[i], "attention"):
+                    enc_copy.layer[i].attention = HFAttentionBypass()
+                elif hasattr(enc_copy, "blocks") and hasattr(enc_copy.blocks[i], "attn"):
+                    enc_copy.blocks[i].attn = TimmAttentionBypass()
+                score = float(self._evaluate_top1(mcopy, self.dl, device=self.device, max_batches=self.batch_limit, progress=False))
+                impact = max(0.0, baseline - score)
+                impacts.append(impact)
+            except Exception as e:
+                if getattr(self, "error_policy", "raise") == "raise":
+                    raise e
+                else:
+                    # Fallback to heuristic for all blocks
+                    return torch.tensor(heuristic_scores, dtype=torch.float32)
+
+        return torch.tensor(impacts, dtype=torch.float32)
+
+    def fit(self):
+        self.att_importance = self._compute_att_depth_importance()
+        self.mlp_importance = self._compute_mlp_importance()
+        return self.att_importance, self.mlp_importance
+
 def count_pruned(masks):
     pruned, total = 0, 0
     for b in masks: 
@@ -310,16 +438,17 @@ def test_unstr_mask_conj(emb_dim, head_dim, num_heads, num_steps, methods, rando
         print(f"Att: {results[0]*100:4.1f}%    Att Eff: {results[2]*100:4.1f}%    MLP: {results[1]*100:4.1f}%    MLP Eff: {results[3]*100:4.1f}%")
     return targets, ats, fcs, at_ef, fc_ef
 
-start = time()
-sps, ats, fcs, at_ef, fc_ef = test_unstr_mask_conj(
-    768, 64, 12, 100,
-    [[DepthPruning, True, True], [WidthPruning, True, True]], False
-)
-end   = time()
+if __name__ == "__main__":
+    start = time()
+    sps, ats, fcs, at_ef, fc_ef = test_unstr_mask_conj(
+        768, 64, 12, 100,
+        [[DepthPruning, True, True], [WidthPruning, True, True]], False
+    )
+    end   = time()
 
-print(f'Time to run test: {round(end-start, 3):.3f} s', end='\n\n')
-print(sps)
-print(ats)
-print(fcs)
-print(at_ef)
-print(fc_ef)
+    print(f'Time to run test: {round(end-start, 3):.3f} s', end='\n\n')
+    print(sps)
+    print(ats)
+    print(fcs)
+    print(at_ef)
+    print(fc_ef)

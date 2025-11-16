@@ -55,6 +55,12 @@ from src.vit_pruning import (
     _get_hidden_and_inter_sizes,
 )
 
+# Import interface provider for importance metrics (from pruning_srp-main)
+PRUNING_DIR = ROOT / "pruning_srp-main"
+if str(PRUNING_DIR) not in sys.path:
+    sys.path.insert(0, str(PRUNING_DIR))
+from mask_conjunction import Auto2SSPInterface
+
 
 def pick_device() -> str:
     if torch.cuda.is_available():
@@ -622,6 +628,18 @@ def run(args):
     ffn_masks = None
     ffn_indices = None
 
+    # Build importance via Auto2SSPInterface once (used by Stage-1/2)
+    calib_loader_for_iface = cal_loader if cal_loader is not None else (train_loader if train_loader is not None else test_loader)
+    iface = Auto2SSPInterface(
+        model=model,
+        pruning_dataloader=calib_loader_for_iface,
+        device=device,
+        importance_mode=(args.depth_importance if args.depth_importance in ("copy", "heuristic") else "heuristic"),
+        batch_limit=args.eval_batches,
+        min_remaining=args.min_remaining,
+    )
+    att_imp, mlp_imp = iface.fit()
+
     if args.stage in ("both", "s1"):
         if args.stage == "both":
             n_to_prune_per_block = [plan.per_block_neurons_to_prune] * B
@@ -646,12 +664,13 @@ def run(args):
             model,
             n_to_prune_per_block=n_to_prune_per_block,
             min_remaining=args.min_remaining,
-            strategy="act_l2",
-            dataloader=cal_loader,
+            strategy="l1",
+            dataloader=None,
             device=device,
             batch_limit=args.eval_batches,
             progress=True,
             collect_masks=True,
+            precomputed_importance=[x.to(torch.float32) for x in mlp_imp],
         )
         if isinstance(s1_res, dict):
             model = s1_res["model"]
@@ -696,7 +715,8 @@ def run(args):
             batch_limit=args.eval_batches,
             importance_mode=args.depth_importance,
             show_progress=True,
-            num_to_prune=num_to_prune,
+            num_to_prune=num_to_prune if num_to_prune is not None else int(round(depth_fraction * B)),
+            selected_indices=[i.item() for i in torch.argsort(att_imp)[:(num_to_prune if num_to_prune is not None else int(round(depth_fraction * B)))]],
         )
         model = res["model"]
         pruned_indices = res["pruned_indices"]
