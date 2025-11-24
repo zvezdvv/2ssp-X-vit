@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# python3 manual-experiments/consensus_mask.py --pattern "manual-experiments/normalized/has-scores.json" --pattern "manual-experiments/normalized/2ssp_vit_b16_ffn_importances.json" --prune 20
+# Example:
+#   python3 manual-experiments/consensus_mask.py --pattern "manual-experiments/normalized/has-scores.json" --pattern "manual-experiments/normalized/2ssp_vit_b16_ffn_importances.json" --prune 20
 """
-Строит бинарную маску (0/1) по консенсусу нескольких методов (файлов) без суммирования:
-- Вход: несколько нормализованных JSON-файлов с листами вида {"i:j": score}, где i — MLP-блок (0..11), j — индекс нейрона.
-- Идея: каждый файл по-своему "предлагает" удалить K наименьших нейронов в каждом блоке (по своим значениям).
-  Затем берём пересечение (consensus) предложений всех файлов по каждому блоку.
-- Чтобы добиться пользовательской доли/процента удаления, мы увеличиваем внутреннюю долю отбора в каждом файле,
-  пока размер пересечения по каждому блоку не достигнет целевого равного K_per_block.
-- На выходе: маска того же формата, что и у aggregate_and_mask.py: словарь листов "i:j" -> 0/1, где 1 означает "удалить".
+Build a binary pruning mask (0/1) by consensus across multiple methods (files), without summation.
 
-Примеры:
-  - Построить консенсусную маску на 20%:
-      python3 manual-experiments/consensus_mask.py --pattern "manual-experiments/normalized/*.json" --prune 20
+Concept:
+- Input: multiple normalized JSON files with leaves shaped like {"i:j": score}, where
+  i = MLP block index (0..11), j = neuron index within that block.
+- Each file independently proposes pruning the bottom-k neurons per block (smallest values).
+  We then take the intersection (consensus) of these proposed sets across all files per block.
+- To reach a user-specified pruning fraction per block, we increase the internal selection fraction t
+  for each file until the size of the intersection for every block reaches the common K_per_block.
+- Output format matches manual-experiments/aggregate_and_mask-summation.py: leaves of {"i:j": 0/1},
+  where 1 means "prune", 0 means "keep".
 
-  - Несколько файлов явно:
-      python3 manual-experiments/consensus_mask.py file1.json file2.json --prune 0.2
+Notes:
+- Equal number of pruned neurons in each of the 12 blocks is ensured by choosing a common
+  K_per_block = min(round(p * N_i)) across all blocks, where N_i is the number of keys present
+  in all files for block i (i.e., intersection of keys).
+- Consensus uses only keys ("i:j") that appear in all files for a given block.
+- If intersection cannot reach the target even at t=1.0 (e.g., due to key mismatches),
+  that block will end up with fewer 1s than requested.
 
-  - Статистика без записи:
-      python3 manual-experiments/consensus_mask.py --pattern "manual-experiments/normalized/*.json" --prune 15 --dry-run
-
-Замечания:
-- Равное число урезаний в каждом из 12 блоков обеспечивается выбором K_per_block = min(round(p*N_i)) по всем блокам.
-- Консенсус считается только по тем ключам "i:j", которые присутствуют во всех файлах (по каждому блоку отдельно).
-- Если пересечение невозможно достичь даже при внутреннем t=1.0 (например, из-за несовпадения ключей), блок получит меньше 1-иц.
+Output key ordering (for readability):
+- Resulting mask dictionaries preserve a stable natural ordering by (block_index=i, neuron_index=j),
+  i.e., numerically sorted by i then j, so keys are not visually shuffled.
 """
 from __future__ import annotations
 
@@ -45,6 +47,7 @@ def is_number(x: Any) -> bool:
 
 
 def looks_like_leaf_ij_dict(d: Dict[str, Any]) -> bool:
+    """True if dict looks like a leaf with keys 'i:j' and numeric values."""
     if not isinstance(d, dict) or not d:
         return False
     for k, v in d.items():
@@ -56,6 +59,7 @@ def looks_like_leaf_ij_dict(d: Dict[str, Any]) -> bool:
 
 
 def find_leaf_ij_dicts(obj: Any, path: List[str] | None = None, out: List[Tuple[PathTuple, Dict[str, float]]] | None = None):
+    """Collect all leaves with 'i:j' keys and numeric values anywhere in the JSON tree."""
     if path is None:
         path = []
     if out is None:
@@ -74,6 +78,7 @@ def find_leaf_ij_dicts(obj: Any, path: List[str] | None = None, out: List[Tuple[
 
 
 def collect_files(default_dir: Path, patterns: List[str], files: List[str]) -> List[Path]:
+    """Collect explicit files and glob patterns, defaulting to all *.json in default_dir."""
     collected: List[Path] = []
     for p in files:
         path = Path(p)
@@ -101,6 +106,7 @@ def load_json(path: Path) -> Any:
 
 
 def dump_json_atomic(data: Any, out_path: Path, compact: bool = True) -> None:
+    """Atomic JSON write with optional compact separators."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
@@ -112,6 +118,7 @@ def dump_json_atomic(data: Any, out_path: Path, compact: bool = True) -> None:
 
 
 def parse_fraction(p: float) -> float:
+    """Convert percent or fraction to [0,1]. If p > 1 treat as percentage (p/100)."""
     if p < 0:
         return 0.0
     return p / 100.0 if p > 1.0 else p
@@ -127,7 +134,7 @@ def rounding_fn(name: str):
 
 def group_by_path(files: List[Path]) -> Dict[PathTuple, List[Dict[str, float]]]:
     """
-    Возвращает: path_tuple -> список листов (по одному на файл, если у файла такой лист есть).
+    Build: path_tuple -> list of ij-leaves (one per file if present in that file).
     """
     bag: Dict[PathTuple, List[Dict[str, float]]] = {}
     for src in files:
@@ -146,9 +153,7 @@ def group_by_path(files: List[Path]) -> Dict[PathTuple, List[Dict[str, float]]]:
 
 
 def split_by_block(leaf: Dict[str, float]) -> Dict[int, Dict[str, float]]:
-    """
-    Разбивает лист {"i:j": val} по блокам i -> { "i:j": val }.
-    """
+    """Split a leaf {"i:j": val} into blocks i -> {"i:j": val}."""
     blocks: Dict[int, Dict[str, float]] = {}
     for k, v in leaf.items():
         m = KEY_RE.match(k)
@@ -159,6 +164,14 @@ def split_by_block(leaf: Dict[str, float]) -> Dict[int, Dict[str, float]]:
     return blocks
 
 
+def key_to_tuple(k: str) -> Tuple[int, int]:
+    """Convert 'i:j' -> (i, j) for natural numeric ordering."""
+    m = KEY_RE.match(k)
+    if not m:
+        return (1 << 30, 1 << 30)
+    return (int(m.group(1)), int(m.group(2)))
+
+
 def consensus_for_path(
     leaves_for_files: List[Dict[str, float]],
     prune_fraction: float,
@@ -166,36 +179,34 @@ def consensus_for_path(
     verbose: bool = True,
 ) -> Dict[str, int]:
     """
-    Для одного path_tuple строит маску по консенсусу:
-    - Для каждого блока i найдём пересечение bottom_k множеств ключей по всем файлам.
-    - Внутреннюю долю t увеличиваем от prune_fraction до 1.0, пока |intersection| по каждому блоку
-      не достигнет K_common = min_i round(prune_fraction * N_i), где N_i — количество ключей,
-      присутствующих во всех файлах для блока i.
-    - Если intersection по блоку превышает K_common, берём K_common с наименьшим средним значением по файлам.
+    Build a per-path mask by consensus:
+    - For each block i, compute the intersection of bottom-k key sets across all files.
+    - Increase internal selection fraction t from prune_fraction up to 1.0 until
+      |intersection_i| >= K_common for every block i, where
+      K_common = min_i round(prune_fraction * N_i) and
+      N_i = number of keys present in all files for block i.
+    - If intersection_i exceeds K_common, pick exactly K_common keys with smallest mean value across files.
+    Mask keys are inserted in stable numeric order by (i, j).
     """
     rfun = rounding_fn(rounding)
 
-    # Разложим каждый файл на блоки: file_blocks[file_index][block_i] = {"i:j": val, ...}
+    # file_blocks[file_idx][block_i] = {"i:j": val, ...}
     per_file_blocks: List[Dict[int, Dict[str, float]]] = [split_by_block(leaf) for leaf in leaves_for_files]
 
-    # Определим множество блоков, которые есть хотя бы у одного файла
+    # All blocks seen in at least one file
     all_blocks = sorted(set().union(*[set(b.keys()) for b in per_file_blocks])) if per_file_blocks else []
 
-    # Для консенсуса используем только ключи, присутствующие во всех файлах (по каждому блоку отдельно)
-    # keys_common[i] = set("i:j") присутствующих во всех файлах
+    # Keys common to all files per block (use natural numeric order by j)
     keys_common: Dict[int, List[str]] = {}
     for i in all_blocks:
         sets = []
         for fb in per_file_blocks:
             keys_i = set(fb.get(i, {}).keys())
             sets.append(keys_i)
-        if not sets:
-            common_set = set()
-        else:
-            common_set = set.intersection(*sets) if sets else set()
-        keys_common[i] = sorted(common_set)
+        common_set = set.intersection(*sets) if sets else set()
+        keys_common[i] = sorted(common_set, key=key_to_tuple)
 
-    # Рассчитаем K_target_i и общий K_common для равенства на всех блоках
+    # Compute targets
     N_per_block = {i: len(keys_common[i]) for i in all_blocks}
     if not N_per_block:
         return {}
@@ -206,15 +217,15 @@ def consensus_for_path(
     if verbose:
         print(f"[consensus] blocks={len(all_blocks)}; N_per_block[0]={N_per_block.get(all_blocks[0], 0) if all_blocks else 0}; K_target_common={K_common}")
 
-    # Если K_common == 0, просто маска из нулей
+    # If K_common == 0, return all zeros in stable order
     if K_common <= 0:
-        mask = {}
+        mask: Dict[str, int] = {}
         for i in all_blocks:
-            for key in keys_common[i]:
+            for key in sorted(keys_common[i], key=key_to_tuple):
                 mask[key] = 0
         return mask
 
-    # Функция, возвращающая пересечение bottom_k множеств для t в [0,1]
+    # Compute intersection for a given t in [0,1]
     def intersection_for_t(t: float) -> Dict[int, List[str]]:
         inter: Dict[int, List[str]] = {}
         for i in all_blocks:
@@ -227,18 +238,18 @@ def consensus_for_path(
             if k == 0:
                 inter[i] = []
                 continue
-            # bottom_k для каждого файла по значениям
+            # bottom-k for each file by values (restricted to keys_i)
             bottom_sets = []
             for fb in per_file_blocks:
                 vals = fb.get(i, {})
-                # сортируем только по keys_i, чтобы все файлы имели одинаковое множество для сравнения
-                sorted_keys = sorted(keys_i, key=lambda kk: vals.get(kk, float("inf")))
+                sorted_keys = sorted(keys_i, key=lambda kk: (vals.get(kk, float("inf")), key_to_tuple(kk)))
                 bottom_sets.append(set(sorted_keys[:k]))
             inter_i = set.intersection(*bottom_sets) if bottom_sets else set()
-            inter[i] = sorted(inter_i)
+            # keep stable numeric order
+            inter[i] = sorted(inter_i, key=key_to_tuple)
         return inter
 
-    # Увеличиваем t пока min_i |intersection_i| >= K_common или пока t < 1.0
+    # Increase t until min_i |intersection_i| >= K_common or t reaches 1.0
     t_low = max(0.0, prune_fraction)
     t = t_low
     inter = intersection_for_t(t)
@@ -246,8 +257,7 @@ def consensus_for_path(
 
     iters = 0
     while min_inter < K_common and t < 1.0 and iters < 100:
-        # Увеличиваем t мультипликативно (быстрее сходится, чем +step)
-        t = min(1.0, t * 1.2 if t > 0 else 0.02)
+        t = min(1.0, t * 1.2 if t > 0 else 0.02)  # multiplicative growth for quicker convergence
         inter = intersection_for_t(t)
         min_inter = min((len(v) for v in inter.values()), default=0)
         iters += 1
@@ -255,12 +265,12 @@ def consensus_for_path(
     if verbose:
         print(f"[consensus] t_final={t:.4f}, min_intersection={min_inter}, K_common={K_common}, iters={iters}")
 
-    # Построим итоговую маску: если intersection_i >= K_common, берём K_common по наименьшему среднему
+    # Build final mask in stable order
     mask: Dict[str, int] = {}
     for i in all_blocks:
         keys_i = keys_common[i]
-        # инициализация нулями
-        for key in keys_i:
+        # initialize zeros in numeric order
+        for key in sorted(keys_i, key=key_to_tuple):
             mask[key] = 0
 
         inter_keys = inter.get(i, [])
@@ -271,43 +281,42 @@ def consensus_for_path(
             for key in inter_keys:
                 mask[key] = 1
         else:
-            # выбрать K_common с наименьшим средним значением по файлам
+            # choose exactly K_common with smallest mean value across files (tie-breaker: key order)
             means: List[Tuple[str, float]] = []
             for key in inter_keys:
                 vals = []
                 for fb in per_file_blocks:
                     v = fb.get(i, {}).get(key, None)
-                    if v is None:
-                        # теоретически не должно случиться (мы отфильтровали keys_common), но защитимся
-                        v = float("inf")
-                    vals.append(float(v))
+                    vals.append(float(v) if v is not None else float("inf"))
                 means.append((key, sum(vals) / max(1, len(vals))))
-            means_sorted = sorted(means, key=lambda kv: kv[1])
+            means_sorted = sorted(means, key=lambda kv: (kv[1], key_to_tuple(kv[0])))
             chosen = {k for k, _ in means_sorted[:K_common]}
-            for key in keys_i:
+            for key in sorted(keys_i, key=key_to_tuple):
                 if key in chosen:
                     mask[key] = 1
     return mask
 
 
 def reconstruct_mask_tree(path_to_mask: Dict[PathTuple, Dict[str, int]]) -> Dict[str, Any]:
+    """Assemble a tree of masks from per-path masks. Insertion order is preserved."""
     root: Dict[str, Any] = {}
     for path, leaf_mask in path_to_mask.items():
         cur = root
         for key in path:
             cur = cur.setdefault(key, {})
+        # leaf_mask insertion order already sorted; update preserves it in Python 3.7+
         cur.update(leaf_mask)
     return root
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build consensus-based pruning mask (equal-per-block) from multiple normalized JSON files.")
-    parser.add_argument("files", nargs="*", help="Входные JSON-файлы с нормализованными значениями (можно перечислить несколько)")
-    parser.add_argument("--pattern", action="append", default=[], help="Глоб-шаблон(ы), например 'manual-experiments/normalized/*.json'")
-    parser.add_argument("--prune", type=float, required=True, help="Процент или доля (0..1) нейронов на блок к удалению (целевой равный K)")
-    parser.add_argument("--rounding", type=str, choices=["floor", "round", "ceil"], default="round", help="Округление при расчёте K")
-    parser.add_argument("--mask-out", type=str, default="manual-experiments/mask_consensus.json", help="Куда сохранить маску (по умолчанию manual-experiments/mask_consensus.json)")
-    parser.add_argument("--dry-run", action="store_true", help="Только показать статистику без записи")
+    parser.add_argument("files", nargs="*", help="Input JSON files with normalized values (you can list multiple)")
+    parser.add_argument("--pattern", action="append", default=[], help="Glob pattern(s), e.g. 'manual-experiments/normalized/*.json'")
+    parser.add_argument("--prune", type=float, required=True, help="Percent or fraction (0..1) of neurons per block to prune (target equal K across blocks)")
+    parser.add_argument("--rounding", type=str, choices=["floor", "round", "ceil"], default="round", help="Rounding for K computation")
+    parser.add_argument("--mask-out", type=str, default="manual-experiments/mask_consensus.json", help="Output path for the consensus mask")
+    parser.add_argument("--dry-run", action="store_true", help="Print stats without writing")
     args = parser.parse_args()
 
     script_dir = Path(__file__).parent.resolve()
@@ -319,7 +328,7 @@ def main() -> None:
         return
     print(f"[info] using {len(inputs)} file(s)")
 
-    # Сгруппируем по path и возьмем только те пути, что присутствуют хотя бы в двух файлах (консенсус имеет смысл)
+    # Group by path and keep only paths present in at least two files (consensus has meaning then)
     paths_bag = group_by_path(inputs)
     common_paths = {pth: leaves for pth, leaves in paths_bag.items() if len(leaves) >= 2}
     if not common_paths:
@@ -339,7 +348,6 @@ def main() -> None:
     if args.dry_run:
         print("[dry] consensus mask would be saved to:", args.mask_out)
         print(f"[dry] total ones (global) = {total_ones}")
-        # Простейшая сводка по первому path
         first_path = next(iter(result_masks.keys()))
         k_sample = sum(result_masks[first_path].values())
         print(f"[dry] sample path={'/'.join(first_path) or '<root>'} ones={k_sample}")

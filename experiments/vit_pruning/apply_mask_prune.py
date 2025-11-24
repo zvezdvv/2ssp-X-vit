@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Применение бинарной маски (0/1) для урезания FFN-нейронов ViT по блокам (Stage-1 width pruning),
-с измерением latency и accuracy. За основу взята логика из experiments/vit_pruning/auto_2ssp.py.
+Apply a binary (0/1) mask to prune ViT FFN neurons block-wise (Stage-1 width pruning) while measuring latency and accuracy. Based on experiments/vit_pruning/auto_2ssp.py.
 
-Особенности:
-- Маска: JSON со структурами-листами, где ключи "i:j" (i — индекс MLP-блока 0..11, j — индекс нейрона),
-  значения 0/1, где 1 = урезать, 0 = оставить. Если формат иной, будет произведён поиск листов
-  с такими ключами в любом месте дерева.
-- Из каждого MLP блока урезается ровно число нейронов, соответствующее количеству единиц в маске для данного блока.
-- Урезание выполняется через src.vit_pruning.prune_vit_mlp_width c передачей:
-  - n_to_prune_per_block = [кол-во единиц в маске по блоку i]
-  - precomputed_importance = векторы длины d_int: для mask=0 присваивается важность +1, для mask=1 — -1.
-    Тогда функция оставит самые важные (keep_idx по убыванию), а помеченные к удалению уйдут.
-- CIFAR-100: используются даталоадеры, аналогичные auto_2ssp.py
-- Модель: SRP checkpoint B/16 с top10_idx=8 (разрешение 224x224), как в auto_2ssp.py:
-    timm -> перенос весов в HF ViTForImageClassification
+Details:
+- Mask: JSON containing leaf dict structures whose keys are "i:j" (i = MLP block index 0..11, j = neuron index) and values 0/1 (1 = prune, 0 = keep). If the format differs, the code searches any leaf dicts with such keys anywhere in the JSON tree.
+- For each MLP block the exact number of neurons marked with 1 in that block's mask is pruned.
+- Pruning uses src.vit_pruning.prune_vit_mlp_width with:
+  - n_to_prune_per_block = [count of ones for block i]
+  - precomputed_importance = vectors of length d_int: mask=0 -> importance +1, mask=1 -> -1.
+    The function then keeps the highest importance neurons (descending keep_idx) and removes the marked ones.
+- CIFAR-100: data loaders identical to auto_2ssp.py
+- Model: SRP checkpoint B/16 with top10_idx=8 (resolution 224x224) as in auto_2ssp.py:
+    timm -> weight transfer into HF ViTForImageClassification
 
-Примеры:
-  1) Применить маску и измерить метрики (CIFAR-100, 5 батчей для быстрой оценки):
+Examples:
+  1) Apply mask and measure metrics (CIFAR-100, 5 batches quick evaluation):
      python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --eval-batches 5
 
-  2) Только оценить без прунинга (проверка базовых метрик):
+  2) Only evaluate without pruning (baseline metrics):
      python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --eval-batches 5 --dry-run
 
-  3) Пользовательские параметры датасета:
+  3) Custom dataset fractions:
      python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --cifar-train-pct 0.25 --cifar-test-pct 0.25 --eval-batches 10
 """
 from __future__ import annotations
