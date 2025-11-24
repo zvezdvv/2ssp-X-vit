@@ -60,6 +60,7 @@ PRUNING_DIR = ROOT / "pruning_srp-main"
 if str(PRUNING_DIR) not in sys.path:
     sys.path.insert(0, str(PRUNING_DIR))
 from mask_conjunction import Auto2SSPInterface
+from process_models import load_model_timm as srp_load_model_timm
 
 
 def pick_device() -> str:
@@ -514,23 +515,22 @@ def run(args):
         model_name = args.model
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
         model = ViTForImageClassification.from_pretrained(model_name)
-        model.classifier = torch.nn.Linear(768, 100, device=device)
-        model = timm2transformers(model, load_model_timm('B/16', 'cifar100'))
+        # Map dataset name for timm checkpoint selection
+        ds_name_srp = (getattr(args, "srp_dataset", "cifar100") or "cifar100").lower()
+        if args.load_cifar:
+            ds_cli = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
+            # Updated loader expects either 'cifar100' or 'oxford-iiit-pet'
+            ds_name_srp = "cifar100" if ds_cli == "cifar100" else "oxford-iiit-pet"
+        num_classes = 100 if ds_name_srp == "cifar100" else 37
+        model.classifier = torch.nn.Linear(768, num_classes, device=device)
+        # Use updated SRP loader with top10_idx=8 (B/16 @224), fallback to legacy if missing deps
+        try:
+            timm_model = srp_load_model_timm('B/16', ds_name_srp, top10_idx=8, verbose=True)
+        except Exception as e:
+            print(f"[WARN] process_models.load_model_timm failed ({e}); falling back to legacy loader.")
+            timm_model = load_model_timm('B/16', ds_name_srp, verbose=True)
+        model = timm2transformers(model, timm_model)
         input_res = 224
-        # models_dir = args.srp_models_dir
-        # index_csv = args.srp_index_csv
-        # srp_ds = getattr(args, "srp_dataset", "cifar100")
-        # model, srp_meta = _load_srp_model(
-        #     model_type=args.srp_model_type,
-        #     dataset_name=srp_ds,
-        #     models_dir=models_dir,
-        #     index_csv_path=index_csv if args.srp_checkpoint_npz is None else None,
-        #     checkpoint_npz=args.srp_checkpoint_npz,
-        #     verbose=True,
-        # )
-        # input_res = int(args.srp_res) if args.srp_res is not None else int(srp_meta["res"])
-        # processor = SimpleNamespace(image_mean=srp_meta["mean"], image_std=srp_meta["std"])
-        # model_name = f"timm/{srp_meta['timm_name']}@{input_res} (SRP:{srp_meta['checkpoint']})"
         # Disable head changes and finetuning for SRP models by default
         args.use_adapter = False
         args.replace_classifier = False
@@ -766,6 +766,25 @@ def run(args):
     artifacts_dir = Path(__file__).resolve().parent / "artifacts" / run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save FFN importances (activation-based or weight L1) in last_format-like structure
+    ffn_importances_path = None
+    try:
+        if mlp_imp is not None:
+            ffn_map = {}
+            for b, imp in enumerate(mlp_imp):
+                try:
+                    vals = imp.detach().cpu().flatten().tolist()
+                except Exception:
+                    vals = [float(x) for x in imp]
+                for j, v in enumerate(vals):
+                    ffn_map[f"{b}:{j}"] = float(v)
+            ffn_importances_path = artifacts_dir / "iterative_vit_b16_ffn_importances.json"
+            with open(ffn_importances_path, "w", encoding="utf-8") as f:
+                json.dump({"ffn": ffn_map}, f, ensure_ascii=False, indent=2)
+            print(f"[ARTIFACT] FFN importances saved to: {ffn_importances_path}")
+    except Exception as e:
+        print(f"[WARN] Failed to save FFN importances: {e}")
+
     # Persist masks/indices as requested
     if ffn_masks is not None:
         try:
@@ -806,6 +825,8 @@ def run(args):
         artifacts["attn_pruned_indices_path"] = str(attn_indices_path)
     if pruned_model_dir is not None:
         artifacts["pruned_model_dir"] = pruned_model_dir
+    if ffn_importances_path is not None:
+        artifacts["ffn_importances_path"] = str(ffn_importances_path)
 
     # Build plan section only for stage='both'
     plan_section = None

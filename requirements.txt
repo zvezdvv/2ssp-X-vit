@@ -1,10 +1,13 @@
-transformers==4.47.1
-ml_collections==1.0.0
-datasets==3.2.0
-sentencepiece==0.2.0
-protobuf
-# Added for ViT pruning experiment
-accelerate
-# timm is an optional dependency for some vision models; included for completeness
-timm
-torchvision
+# Minimal runtime deps for adaptation-for-Pures-framework/auto_2ssp.py
+# CPU/MPS/CUDA builds of torch/torchvision will be resolved by pip for your platform
+numpy>=1.26
+torch>=2.1
+torchvision>=0.16
+transformers>=4.44
+datasets>=2.19
+pillow>=10.0
+pandas>=2.2
+# vision backbones and SRP checkpoint loader
+timm>=0.9
+# optional progress bars
+tqdm>=4.66
