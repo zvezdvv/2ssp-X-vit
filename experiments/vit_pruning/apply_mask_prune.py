@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --eval-on test --calib-per-class 2 --eval-batches 5
 """
 Apply a binary (0/1) mask to prune ViT FFN neurons block-wise (Stage-1 width pruning) while measuring latency and accuracy. Based on experiments/vit_pruning/auto_2ssp.py.
 
@@ -22,7 +23,7 @@ Examples:
      python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --eval-batches 5 --dry-run
 
   3) Custom dataset fractions:
-     python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --cifar-train-pct 0.25 --cifar-test-pct 0.25 --eval-batches 10
+     python3 experiments/vit_pruning/apply_mask_prune.py --mask manual-experiments/mask.json --cifar-train-pct 0.25 --cifar-test-pct 0.25 --eval-batches 10 --calib_per_class 1
 """
 from __future__ import annotations
 
@@ -102,7 +103,7 @@ def measure_latency(model: nn.Module, device: str, warmup: int = 3, iters: int =
     return (time.time() - start) / iters
 
 
-def load_cifar(processor, device: str, dataset: str = "cifar100", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 2, num_workers: Optional[int] = None, img_size: int = 224):
+def load_cifar(processor, device: str, dataset: str = "cifar100", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 0, num_workers: Optional[int] = None, img_size: int = 224):
     # Lazy imports
     from datasets import load_dataset
     from torchvision import transforms
@@ -149,6 +150,21 @@ def load_cifar(processor, device: str, dataset: str = "cifar100", train_pct: flo
 
     train_ds = train_raw.map(lambda e: preprocess(e, True))
     test_ds = test_raw.map(lambda e: preprocess(e, False))
+    # Ограничение числа примеров на класс если задано (>0)
+    if calib_per_class and calib_per_class > 0:
+        # Собираем индексы с максимумом calib_per_class на класс
+        label_column = "labels"
+        counts = {}
+        kept_idx = []
+        labels = train_ds[label_column]
+        for idx, lbl in enumerate(labels):
+            c = counts.get(int(lbl), 0)
+            if c < calib_per_class:
+                kept_idx.append(idx)
+                counts[int(lbl)] = c + 1
+        if kept_idx:
+            train_ds = train_ds.select(kept_idx)
+            print(f"[INFO] calib_per_class={calib_per_class}: train subset size={len(train_ds)}")
     train_ds.set_format(type="torch", columns=["pixel_values", "labels"])
     test_ds.set_format(type="torch", columns=["pixel_values", "labels"])
 
@@ -300,12 +316,14 @@ def run(args):
         train_pct=args.cifar_train_pct,
         test_pct=args.cifar_test_pct,
         img_size=input_res,
+        calib_per_class=args.calib_per_class
     )
 
     # Baseline metrics
     params_before = count_total_params(model)
     latency_baseline = measure_latency(model, device, warmup=3, iters=10, img_size=input_res)
-    acc_baseline = evaluate_top1(model, test_loader, device=device, max_batches=args.eval_batches, progress=True)
+    eval_loader = test_loader if args.eval_on == "test" else train_loader
+    acc_baseline = evaluate_top1(model, eval_loader, device=device, max_batches=args.eval_batches, progress=True)
     print(f"[BASE] params={params_before}, latency={latency_baseline*1000:.2f} ms, acc={acc_baseline:.4f}")
 
     if args.dry_run:
@@ -379,7 +397,7 @@ def run(args):
     # Post-prune metrics
     params_after = count_total_params(model)
     latency_after = measure_latency(model, device, warmup=3, iters=10, img_size=input_res)
-    acc_after = evaluate_top1(model, test_loader, device=device, max_batches=args.eval_batches, progress=True)
+    acc_after = evaluate_top1(model, eval_loader, device=device, max_batches=args.eval_batches, progress=True)
 
     s1 = compute_actual_sparsity(params_before, params_after)
 
@@ -400,6 +418,8 @@ def run(args):
             "mask_path": str(mask_path),
             "dataset": "cifar100",
             "eval_batches": args.eval_batches,
+            "eval_on": args.eval_on,
+            "calib_per_class": args.calib_per_class,
             "min_remaining": args.min_remaining,
             "model": "ViT B/16 (SRP timm -> HF), top10_idx=8, res=224",
         },
@@ -431,7 +451,10 @@ def build_argparser():
     p.add_argument("--cifar-train-pct", type=float, default=0.25)
     p.add_argument("--cifar-test-pct", type=float, default=0.25)
     p.add_argument("--eval-batches", type=int, default=5, help="Число батчей для быстрой оценки accuracy")
+    p.add_argument("--eval-on", type=str, default="test", choices=["test", "train"], help="Which split to evaluate accuracy on: 'test' or 'train' (default: test)")
     p.add_argument("--dry-run", action="store_true", help="Не выполнять прунинг, только измерить baseline метрики")
+    p.add_argument("--calib-per-class", type=int, default=0, help="Макс. число тренировочных изображений на класс (0 = без ограничения)")
+    p.add_argument("--calib_per_class", type=int, dest="calib_per_class", help="Алиас для --calib-per-class")
     return p
 
 

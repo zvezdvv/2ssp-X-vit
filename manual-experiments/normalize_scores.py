@@ -3,8 +3,8 @@
 #python3 manual-experiments/normalize_scores.py
 """
 Normalize numeric importance scores in JSON files to [0, 1] without changing the file structure.
-- All numeric values are transformed as: v_norm = (|v| - min_abs) / (max_abs - min_abs)
-- If all |v| are equal (max_abs == min_abs), normalized values become 0.0
+- All numeric values are transformed as: v_norm = (v - min_val) / (max_val - min_val)
+- If all values are equal (max_val == min_val), normalized values become 0.0
 - Non-numeric values (including booleans) are preserved as-is
 - Nested structures (dicts/lists) are preserved exactly in shape and key order
 - By default, normalized files are written to manual-experiments/normalized/<same-name>.json
@@ -41,49 +41,47 @@ def is_number(x: Any) -> bool:
     return (isinstance(x, (int, float)) and not isinstance(x, bool))
 
 
-def scan_min_max_abs(obj: Any) -> Tuple[float | None, float | None]:
-    """Traverse nested JSON-like structure and compute (min_abs, max_abs) across all numbers."""
-    min_abs = math.inf
-    max_abs = -math.inf
+def scan_min_max_raw(obj: Any) -> Tuple[float | None, float | None]:
+    """Traverse nested JSON-like structure and compute (min_val, max_val) across all numbers (raw values)."""
+    min_val = math.inf
+    max_val = -math.inf
 
     stack: list[Any] = [obj]
     while stack:
         cur = stack.pop()
         if is_number(cur):
-            a = abs(float(cur))
-            if a < min_abs:
-                min_abs = a
-            if a > max_abs:
-                max_abs = a
+            v = float(cur)
+            if v < min_val:
+                min_val = v
+            if v > max_val:
+                max_val = v
         elif isinstance(cur, list):
             stack.extend(cur)
         elif isinstance(cur, dict):
-            # preserve key order; we only read values for scanning
             stack.extend(cur.values())
         # else: ignore None, str, bool, etc.
 
-    if min_abs is math.inf:
+    if min_val is math.inf:
         return None, None
-    return float(min_abs), float(max_abs)
+    return float(min_val), float(max_val)
 
 
-def normalize_value(v: float, min_abs: float, max_abs: float) -> float:
-    """Min-max normalize after abs to [0, 1]."""
-    a = abs(float(v))
-    if max_abs == min_abs:
+def normalize_value(v: float, min_val: float, max_val: float) -> float:
+    """Raw min-max normalize to [0,1]."""
+    if max_val == min_val:
         return 0.0
-    return (a - min_abs) / (max_abs - min_abs)
+    return (float(v) - min_val) / (max_val - min_val)
 
 
-def normalize_structure(obj: Any, min_abs: float, max_abs: float) -> Any:
+def normalize_structure(obj: Any, min_val: float, max_val: float) -> Any:
     """Return a new structure with all numeric values normalized, preserving shapes/keys."""
     if is_number(obj):
-        return normalize_value(obj, min_abs, max_abs)
+        return normalize_value(obj, min_val, max_val)
     if isinstance(obj, list):
-        return [normalize_structure(x, min_abs, max_abs) for x in obj]
+        return [normalize_structure(x, min_val, max_val) for x in obj]
     if isinstance(obj, dict):
         # dict order preserved by default in Python 3.7+
-        return {k: normalize_structure(v, min_abs, max_abs) for k, v in obj.items()}
+        return {k: normalize_structure(v, min_val, max_val) for k, v in obj.items()}
     return obj  # str, bool, None, etc.
 
 
@@ -103,18 +101,18 @@ def dump_json_atomic(data: Any, out_path: Path) -> None:
 
 def process_file(src: Path, dst: Path, dry_run: bool = False) -> None:
     data = load_json(src)
-    min_abs, max_abs = scan_min_max_abs(data)
-    if min_abs is None:
+    min_val, max_val = scan_min_max_raw(data)
+    if min_val is None:
         print(f"[skip] {src} — no numeric values found")
         return
 
     if dry_run:
-        print(f"[dry]  {src}  min_abs={min_abs:.6g}, max_abs={max_abs:.6g}  => {dst}")
+        print(f"[dry]  {src}  min_val={min_val:.6g}, max_val={max_val:.6g}  => {dst}")
         return
 
-    normalized = normalize_structure(data, min_abs, max_abs)
+    normalized = normalize_structure(data, min_val, max_val)
     dump_json_atomic(normalized, dst)
-    print(f"[ok]   {src}  ->  {dst}  (min_abs={min_abs:.6g}, max_abs={max_abs:.6g})")
+    print(f"[ok]   {src}  ->  {dst}  (min_val={min_val:.6g}, max_val={max_val:.6g})")
 
 
 def collect_files(script_dir: Path, patterns: list[str], files: list[str]) -> list[Path]:
@@ -149,7 +147,7 @@ def collect_files(script_dir: Path, patterns: list[str], files: list[str]) -> li
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Normalize numeric importance scores in JSON files to [0,1] after absolute value.")
+    parser = argparse.ArgumentParser(description="Normalize numeric importance scores in JSON files to [0,1] using raw min-max scaling.")
     parser.add_argument("files", nargs="*", help="Explicit JSON files to process")
     parser.add_argument("--pattern", action="append", default=[], help="Glob pattern(s), e.g. 'manual-experiments/*.json'")
     parser.add_argument("--inplace", action="store_true", help="Overwrite original files in place")
