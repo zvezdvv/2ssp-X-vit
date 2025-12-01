@@ -297,6 +297,101 @@ def consensus_for_path(
     return mask
 
 
+def consensus_for_path_global_capped(
+    leaves_for_files: List[Dict[str, float]],
+    prune_fraction: float,
+    max_block_frac: float,
+    rounding: str = "round",
+    verbose: bool = True,
+) -> Dict[str, int]:
+    """
+    Global pruning across all MLP blocks (within a single path) with per-block cap:
+      - Consider only keys common across all files per block (consensus domain).
+      - Compute total_N = sum_i N_i where N_i = |common keys in block i|.
+      - K_global = round(prune_fraction * total_N).
+      - cap_i = round(max_block_frac * N_i) for each block.
+      - Define a global score per key as mean value across files.
+      - Sort all keys across all blocks by ascending score (tie by (i,j));
+        select the smallest until reaching K_global but never exceeding cap_i for any block.
+    The resulting mask contains only keys common across all files, preserving numeric order.
+    """
+    rfun = rounding_fn(rounding)
+
+    # Per-file blocks: file_idx -> {block_i: {"i:j": val}}
+    per_file_blocks: List[Dict[int, Dict[str, float]]] = [split_by_block(leaf) for leaf in leaves_for_files]
+
+    # All blocks present in any file
+    all_blocks = sorted(set().union(*[set(b.keys()) for b in per_file_blocks])) if per_file_blocks else []
+
+    # Keys common across all files per block (stable numeric ordering)
+    keys_common: Dict[int, List[str]] = {}
+    for i in all_blocks:
+        sets = []
+        for fb in per_file_blocks:
+            keys_i = set(fb.get(i, {}).keys())
+            sets.append(keys_i)
+        common_set = set.intersection(*sets) if sets else set()
+        keys_common[i] = sorted(common_set, key=key_to_tuple)
+
+    # Sizes per block and totals
+    N_per_block = {i: len(keys_common[i]) for i in all_blocks}
+    if not N_per_block:
+        return {}
+
+    # Clamp fractions
+    prune_fraction = max(0.0, min(1.0, prune_fraction))
+    max_block_frac = max(0.0, min(1.0, max_block_frac))
+
+    total_N = sum(N_per_block.values())
+    K_global = max(0, min(total_N, rfun(prune_fraction * total_N)))
+    caps = {i: max(0, min(N_per_block[i], rfun(max_block_frac * N_per_block[i]))) for i in all_blocks}
+    caps_sum = sum(caps.values())
+    K_target = min(K_global, caps_sum)
+
+    if verbose:
+        print(f"[consensus-global] blocks={len(all_blocks)} total_N={total_N} K_global={K_global} K_target={K_target} caps_sum={caps_sum}")
+
+    # If nothing to prune, return zeros for common keys
+    if K_target <= 0:
+        mask: Dict[str, int] = {}
+        for i in all_blocks:
+            for key in keys_common[i]:
+                mask[key] = 0
+        return mask
+
+    # Build global list of (key, mean_score, block_i)
+    items: List[Tuple[str, float, int]] = []
+    for i in all_blocks:
+        common_keys = keys_common[i]
+        for key in common_keys:
+            vals = []
+            for fb in per_file_blocks:
+                v = fb.get(i, {}).get(key, None)
+                vals.append(float(v) if v is not None else float("inf"))
+            mean_v = sum(vals) / max(1, len(vals))
+            items.append((key, mean_v, i))
+
+    # Sort by mean score, tie-break by numeric (i,j)
+    items_sorted = sorted(items, key=lambda t: (t[1], key_to_tuple(t[0])))
+
+    # Select under per-block caps
+    selected = set()
+    used_per_block = {i: 0 for i in all_blocks}
+    for key, _, i in items_sorted:
+        if len(selected) >= K_target:
+            break
+        if used_per_block[i] < caps[i]:
+            selected.add(key)
+            used_per_block[i] += 1
+
+    # Build mask in stable numeric order for common keys
+    mask: Dict[str, int] = {}
+    for i in all_blocks:
+        for key in keys_common[i]:
+            mask[key] = 1 if key in selected else 0
+    return mask
+
+
 def reconstruct_mask_tree(path_to_mask: Dict[PathTuple, Dict[str, int]]) -> Dict[str, Any]:
     """Assemble a tree of masks from per-path masks. Insertion order is preserved."""
     root: Dict[str, Any] = {}
@@ -316,6 +411,8 @@ def main() -> None:
     parser.add_argument("--prune", type=float, required=True, help="Percent or fraction (0..1) of neurons per block to prune (target equal K across blocks)")
     parser.add_argument("--rounding", type=str, choices=["floor", "round", "ceil"], default="round", help="Rounding for K computation")
     parser.add_argument("--mask-out", type=str, default="manual-experiments/mask_consensus.json", help="Output path for the consensus mask")
+    parser.add_argument("--pruning-mode", type=str, choices=["local", "global_capped"], default="local", help="Pruning strategy. 'local' ensures equal per-block K via consensus. 'global_capped' globally sorts scores with per-block cap.")
+    parser.add_argument("--max-block-frac", type=float, default=0.3, help="Max fraction (0..1 or percent >1) pruned from any block in 'global_capped' mode (default: 0.3 = 30%)")
     parser.add_argument("--dry-run", action="store_true", help="Print stats without writing")
     args = parser.parse_args()
 
@@ -336,10 +433,27 @@ def main() -> None:
         return
 
     prune_fraction = parse_fraction(args.prune)
+    max_block_frac = parse_fraction(args.max_block_frac)
+    max_block_frac = max(0.0, min(1.0, max_block_frac))
+
     result_masks: Dict[PathTuple, Dict[str, int]] = {}
     total_ones = 0
     for pth, leaves in common_paths.items():
-        mask_leaf = consensus_for_path(leaves, prune_fraction=prune_fraction, rounding=args.rounding, verbose=True)
+        if args.pruning_mode == "global_capped":
+            mask_leaf = consensus_for_path_global_capped(
+                leaves_for_files=leaves,
+                prune_fraction=prune_fraction,
+                max_block_frac=max_block_frac,
+                rounding=args.rounding,
+                verbose=True,
+            )
+        else:
+            mask_leaf = consensus_for_path(
+                leaves_for_files=leaves,
+                prune_fraction=prune_fraction,
+                rounding=args.rounding,
+                verbose=True,
+            )
         result_masks[pth] = mask_leaf
         total_ones += sum(mask_leaf.values())
 

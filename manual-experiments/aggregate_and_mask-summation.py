@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # python3 manual-experiments/aggregate_and_mask-summation.py --pattern "manual-experiments/normalized/has-scores.json" --pattern "manual-experiments/normalized/2ssp_vit_b16_ffn_importances.json" --prune 20
+# --pruning-mode global_capped --max-block-frac 30
+# --pruning-mode local
+# python3 manual-experiments/aggregate_and_mask-summation.py --pattern "manual-experiments/normalized/snp_scores.json" --prune 30 --pruning-mode global_capped --max-block-frac 70
+
 """
 Aggregate (element-wise sum) values from provided normalized JSON files
 and build a binary pruning mask (0/1) for MLP neurons based on the sums.
@@ -269,6 +273,90 @@ def make_mask_for_leaf(
     return mask
 
 
+def make_mask_for_leaf_global_capped(
+    leaf: Dict[str, float],
+    prune_fraction: float,
+    max_block_frac: float,
+    rounding: str = "round",
+) -> Dict[str, int]:
+    """
+    Global pruning across all MLP blocks with per-block cap:
+      - compute K_global = round(prune_fraction * sum_i N_i)
+      - compute cap_i = round(max_block_frac * N_i) for each block i
+      - sort all ("i:j", value) globally by ascending value (stable tie-breaker by (i,j))
+      - pick smallest until reaching K_global but never exceeding cap_i in any block
+    """
+    # Group by blocks
+    groups = build_block_groups(leaf)
+
+    # If no groups, return all zeros preserving numeric order
+    if not groups:
+        mask: Dict[str, int] = {}
+        keys_sorted = sorted(
+            leaf.keys(),
+            key=lambda kk: (int(kk.split(":")[0]), int(kk.split(":")[1])) if KEY_RE.match(kk) else (1 << 30, 1 << 30),
+        )
+        for kk in keys_sorted:
+            mask[kk] = 0
+        return mask
+
+    rfun = rounding_fn(rounding)
+
+    # Clamp fraction to [0,1]
+    prune_fraction = max(0.0, min(1.0, prune_fraction))
+    max_block_frac = max(0.0, min(1.0, max_block_frac))
+
+    # Sizes and caps
+    n_per_block = {i: len(items) for i, items in groups.items()}
+    caps = {i: max(0, min(n, rfun(max_block_frac * n))) for i, n in n_per_block.items()}
+    total_n = sum(n_per_block.values())
+    k_global = max(0, min(total_n, rfun(prune_fraction * total_n)))
+    k_target = min(k_global, sum(caps.values()))
+
+    # If nothing to prune, return zeros
+    if k_target <= 0:
+        mask: Dict[str, int] = {}
+        keys_sorted = sorted(
+            leaf.keys(),
+            key=lambda kk: (int(kk.split(":")[0]), int(kk.split(":")[1])) if KEY_RE.match(kk) else (1 << 30, 1 << 30),
+        )
+        for kk in keys_sorted:
+            mask[kk] = 0
+        return mask
+
+    # Flatten all items across blocks: (key, value, block_i)
+    all_items: List[Tuple[str, float, int]] = []
+    for i, items in groups.items():
+        for k, v in items:
+            all_items.append((k, float(v), i))
+
+    # Stable numeric ordering for ties
+    def key_to_tuple_local(kk: str) -> Tuple[int, int]:
+        m = KEY_RE.match(kk)
+        if not m:
+            return (1 << 30, 1 << 30)
+        return (int(m.group(1)), int(m.group(2)))
+
+    all_items_sorted = sorted(all_items, key=lambda t: (t[1], key_to_tuple_local(t[0])))
+
+    # Select under per-block caps
+    selected = set()
+    used_per_block = {i: 0 for i in n_per_block.keys()}
+    for k, _, i in all_items_sorted:
+        if len(selected) >= k_target:
+            break
+        if used_per_block[i] < caps[i]:
+            selected.add(k)
+            used_per_block[i] += 1
+
+    # Build mask with stable numeric key order
+    mask: Dict[str, int] = {}
+    keys_sorted = sorted(leaf.keys(), key=key_to_tuple_local)
+    for kk in keys_sorted:
+        mask[kk] = 1 if kk in selected else 0
+    return mask
+
+
 def apply_masks_to_leaves(aggregated_leaves: Dict[PathTuple, Dict[str, float]], masks_by_path: Dict[PathTuple, Dict[str, int]]) -> Dict[str, Any]:
     """
     Assemble a tree of masks from per-leaf masks.
@@ -292,6 +380,8 @@ def main() -> None:
     parser.add_argument("--prune", type=float, default=None, help="Percent or fraction (0..1) of neurons to prune. E.g., 20 or 0.2")
     parser.add_argument("--rounding", type=str, choices=["floor", "round", "ceil"], default="round", help="Rounding mode when computing K from percent")
     parser.add_argument("--per-block-k", type=int, default=None, help="Set exact K neurons per block (overrides --prune)")
+    parser.add_argument("--pruning-mode", type=str, choices=["local", "global_capped"], default="local", help="Pruning strategy. 'local' keeps equal K per block. 'global_capped' performs global sorting across all blocks with per-block cap.")
+    parser.add_argument("--max-block-frac", type=float, default=0.3, help="Max fraction (0..1 or percent >1) to prune from any single block in 'global_capped' mode (default: 0.3 = 30%)")
     parser.add_argument("--dry-run", action="store_true", help="Do not write files, only print statistics")
     args = parser.parse_args()
 
@@ -348,12 +438,24 @@ def main() -> None:
         masks_by_path: Dict[PathTuple, Dict[str, int]] = {}
         per_leaf_stats: List[str] = []
         for path, leaf in aggregated_leaves.items():
-            mask = make_mask_for_leaf(
-                leaf,
-                prune_fraction=prune_fraction,
-                rounding=args.rounding,
-                per_block_k=args.per_block_k,
-            )
+            if args.pruning_mode == "global_capped":
+                if args.per_block_k is not None:
+                    print("[warn] --per-block-k is ignored in 'global_capped' mode; using global target instead.")
+                max_block_frac = parse_fraction(args.max_block_frac)
+                max_block_frac = max(0.0, min(1.0, max_block_frac))
+                mask = make_mask_for_leaf_global_capped(
+                    leaf,
+                    prune_fraction=prune_fraction,
+                    max_block_frac=max_block_frac,
+                    rounding=args.rounding,
+                )
+            else:
+                mask = make_mask_for_leaf(
+                    leaf,
+                    prune_fraction=prune_fraction,
+                    rounding=args.rounding,
+                    per_block_k=args.per_block_k,
+                )
             masks_by_path[path] = mask
             # Per-leaf stats
             groups = build_block_groups(leaf)
@@ -363,7 +465,7 @@ def main() -> None:
             k_block = sum(v for k, v in mask.items() if k.startswith(f"{any_block}:"))
             # more accurate per-block K via explicit count
             k_block = sum(1 for k in groups[any_block] if mask[k[0]] == 1)
-            per_leaf_stats.append(f"path={'/'.join(path) or '<root>'} blocks={n_blocks} total={n_total} K_per_block~{k_block}")
+            per_leaf_stats.append(f"path={'/'.join(path) or '<root>'} blocks={n_blocks} total={n_total} K_block_example={k_block}")
 
         mask_tree = apply_masks_to_leaves(aggregated_leaves, masks_by_path)
 
