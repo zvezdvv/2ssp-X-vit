@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# python3 manual-experiments/run_summation_grid.py --sizes 1,2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50
+# python3 manual-experiments/run_summation_grid.py --sizes 1,2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50,55,60,65,70
+
+from __future__ import annotations
+
+"""
+python3 manual-experiments/run_summation_grid.py --sizes 1,2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50,55,60,65,70 --pruning-mode local
+
+python3 manual-experiments/run_summation_grid.py --sizes 1,2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50,55,60,65,70 --pruning-mode global_capped --max-block-frac 70
+"""
+
 """
 Оркестратор последовательного запуска:
 1) manual-experiments/aggregate_and_mask-summation.py (агрегация и генерация маски)
@@ -40,8 +49,6 @@ CSV-колонки:
   acc_baseline, acc_stage1, acc_drop_stage1_percent,
   status
 """
-
-from __future__ import annotations
 
 import argparse
 import itertools
@@ -211,7 +218,7 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def build_aggregate_cmd(files: Sequence[Path], prune: int) -> List[str]:
+def build_aggregate_cmd(files: Sequence[Path], prune: int, pruning_mode: str, max_block_frac: Optional[float]) -> List[str]:
     cmd = [sys.executable, str(AGG_SCRIPT)]
     # Передаём файлы позиционными аргументами (а не --pattern), чтобы избежать glob с абсолютными путями
     # и ошибки "Non-relative patterns are unsupported".
@@ -222,6 +229,10 @@ def build_aggregate_cmd(files: Sequence[Path], prune: int) -> List[str]:
             rel = p
         cmd.append(str(rel))
     cmd += ["--prune", str(prune)]
+    if pruning_mode:
+        cmd += ["--pruning-mode", pruning_mode]
+    if pruning_mode == "global_capped" and (max_block_frac is not None):
+        cmd += ["--max-block-frac", str(max_block_frac)]
     return cmd
 
 
@@ -295,6 +306,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--prune-levels", type=str, default=None, help="Список уровней sparsity через запятую, например '5,10,15'. По умолчанию 5..50 шаг 5.")
     ap.add_argument("--first-n-combos", type=int, default=0, help="Ограничить число первых комбинаций (после сортировки) для быстрого теста. 0 = без ограничения.")
     ap.add_argument("--no-resume", action="store_true", help="Не пропускать уже успешные (status=ok) записи из CSV; по умолчанию пропускать (resume).")
+    ap.add_argument("--pruning-mode", type=str, choices=["local", "global_capped"], default="local", help="Режим прунинга для aggregate_and_mask-summation.py: 'local' — равный K на блок; 'global_capped' — глобальная сортировка с ограничением на блок.")
+    ap.add_argument("--max-block-frac", type=float, default=None, help="Максимальная доля (0..1 или процент >1) для одного блока в режиме 'global_capped'. Если не указано — используется дефолт скрипта агрегации.")
     return ap
 
 
@@ -336,7 +349,12 @@ def main() -> None:
             print(f"\n--- [{total_runs}] prune={prune} ---")
 
             # 1) Агрегация и построение маски
-            agg_cmd = build_aggregate_cmd(files_combo, prune)
+            agg_cmd = build_aggregate_cmd(
+                files_combo,
+                prune,
+                getattr(args, "pruning_mode", "local"),
+                getattr(args, "max_block_frac", None),
+            )
             print("[RUN] ", " ".join(agg_cmd))
             rc1, out1, err1 = run_cmd(agg_cmd)
             if rc1 != 0:

@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # python3 manual-experiments/run_consensus_grid.py --sizes 2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50,55,60,65,70
+
+from __future__ import annotations
+"""
+Consensus, global_capped:
+python3 manual-experiments/run_consensus_grid.py --sizes 2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50,55,60,65,70 --pruning-mode global_capped --max-block-frac 70
+
+python3 manual-experiments/run_consensus_grid.py --sizes 2,3,4 --prune-levels 5,10,15,20,25,30,35,40,45,50,55,60,65,70 --pruning-mode local
+"""
+
 """
 Оркестратор последовательного запуска для consensus-подхода:
 1) manual-experiments/consensus_mask.py (построение консенсусной маски)
@@ -38,8 +47,6 @@ CSV-колонки:
   acc_baseline, acc_stage1, acc_drop_stage1_percent,
   status
 """
-
-from __future__ import annotations
 
 import argparse
 import itertools
@@ -209,7 +216,7 @@ def run_cmd(cmd: List[str]) -> Tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def build_aggregate_cmd(files: Sequence[Path], prune: int) -> List[str]:
+def build_aggregate_cmd(files: Sequence[Path], prune: int, pruning_mode: str, max_block_frac: Optional[float]) -> List[str]:
     cmd = [sys.executable, str(AGG_SCRIPT)]
     # Передаём файлы позиционными аргументами (а не --pattern), чтобы избежать glob с абсолютными путями
     for p in files:
@@ -219,23 +226,32 @@ def build_aggregate_cmd(files: Sequence[Path], prune: int) -> List[str]:
             rel = p
         cmd.append(str(rel))
     cmd += ["--prune", str(prune)]
+    if pruning_mode:
+        cmd += ["--pruning-mode", pruning_mode]
+    if pruning_mode == "global_capped" and (max_block_frac is not None):
+        cmd += ["--max-block-frac", str(max_block_frac)]
     return cmd
 
 
-def build_apply_cmd() -> List[str]:
+def build_apply_cmd(args) -> List[str]:
     # Для consensus-пайплайна используем маску manual-experiments/mask_consensus.json
-    return [
+    cmd = [
         sys.executable,
         str(APPLY_SCRIPT),
         "--mask",
         str(MASK_PATH),
         "--eval-on",
-        "test",
+        str(getattr(args, "apply_eval_on", "train")),
         "--calib-per-class",
-        "2",
+        str(getattr(args, "apply_calib_per_class", 7)),
+        "--calib-select",
+        str(getattr(args, "apply_calib_select", "random")),
         "--eval-batches",
-        "5",
+        str(getattr(args, "apply_eval_batches", 32)),
     ]
+    if getattr(args, "apply_seed", None) is not None:
+        cmd += ["--seed", str(args.apply_seed)]
+    return cmd
 
 
 def iterate_combinations(files: Sequence[Path], sizes: Set[int]) -> Iterable[Tuple[Path, ...]]:
@@ -292,6 +308,14 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--prune-levels", type=str, default=None, help="Список уровней sparsity через запятую, например '5,10,15'. По умолчанию 5..70 шаг 5.")
     ap.add_argument("--first-n-combos", type=int, default=0, help="Ограничить число первых комбинаций (после сортировки) для быстрого теста. 0 = без ограничения.")
     ap.add_argument("--no-resume", action="store_true", help="Не пропускать уже успешные (status=ok) записи из CSV; по умолчанию пропускать (resume).")
+    ap.add_argument("--pruning-mode", type=str, choices=["local", "global_capped"], default="local", help="Режим прунинга для consensus_mask.py: 'local' — равный K на блок через консенсус; 'global_capped' — глобальная сортировка средних значений с ограничением на блок.")
+    ap.add_argument("--max-block-frac", type=float, default=None, help="Максимальная доля (0..1 или процент >1) для одного блока в режиме 'global_capped'. Если не указано — используется дефолт скрипта консенсуса.")
+    # Параметры для этапа применения маски (проксируются в apply_mask_prune.py)
+    ap.add_argument("--apply-eval-on", type=str, choices=["train", "test"], default="train", help="Передать в apply_mask_prune: --eval-on (default: train)")
+    ap.add_argument("--apply-calib-per-class", type=int, default=7, help="Передать в apply_mask_prune: --calib-per-class (default: 7)")
+    ap.add_argument("--apply-calib-select", type=str, choices=["first", "random"], default="random", help="Передать в apply_mask_prune: --calib-select (default: random)")
+    ap.add_argument("--apply-eval-batches", type=int, default=32, help="Передать в apply_mask_prune: --eval-batches (default: 32)")
+    ap.add_argument("--apply-seed", type=int, default=3, help="Передать в apply_mask_prune: --seed (default: 3)")
     return ap
 
 
@@ -333,7 +357,12 @@ def main() -> None:
             print(f"\n--- [{total_runs}] prune={prune} ---")
 
             # 1) Построение консенсусной маски
-            agg_cmd = build_aggregate_cmd(files_combo, prune)
+            agg_cmd = build_aggregate_cmd(
+                files_combo,
+                prune,
+                getattr(args, "pruning_mode", "local"),
+                getattr(args, "max_block_frac", None),
+            )
             print("[RUN] ", " ".join(agg_cmd))
             rc1, out1, err1 = run_cmd(agg_cmd)
             if rc1 != 0:
@@ -353,7 +382,7 @@ def main() -> None:
                 continue
 
             # 2) Применение маски и измерения (тяжёлая часть — строго последовательно, ждём завершения)
-            apply_cmd = build_apply_cmd()
+            apply_cmd = build_apply_cmd(args)
             print("[RUN] ", " ".join(apply_cmd))
             rc2, out2, err2 = run_cmd(apply_cmd)
 
