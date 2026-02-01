@@ -34,8 +34,6 @@ import urllib.request
 import urllib.error
 import subprocess
 import ssl
-import random
-import numpy as np
 
 # Local imports
 import sys
@@ -73,54 +71,6 @@ def pick_device() -> str:
     return "cpu"
 
 
-def set_seed(seed: int) -> None:
-    """
-    Глобально фиксирует seed для Python/NumPy/PyTorch и включает детерминизм.
-    """
-    try:
-        random.seed(seed)
-    except Exception:
-        pass
-    try:
-        np.random.seed(seed)
-    except Exception:
-        pass
-    try:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-    except Exception:
-        pass
-    try:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    except Exception:
-        pass
-    try:
-        torch.use_deterministic_algorithms(True)
-    except Exception:
-        pass
-
-
-def seed_worker_init(worker_id: int):
-    """
-    Инициализирует RNG в воркере DataLoader детерминированно на основе torch.initial_seed().
-    """
-    worker_seed = torch.initial_seed() % 2**32
-    try:
-        np.random.seed(worker_seed)
-    except Exception:
-        pass
-    try:
-        random.seed(worker_seed)
-    except Exception:
-        pass
-    try:
-        torch.manual_seed(worker_seed)
-    except Exception:
-        pass
-
-
 def measure_latency(model: nn.Module, device: str, warmup: int = 3, iters: int = 10, img_size: int = 224) -> float:
     model.eval()
     if torch.cuda.is_available():
@@ -149,7 +99,7 @@ def measure_latency(model: nn.Module, device: str, warmup: int = 3, iters: int =
     return (time.time() - start) / iters  # seconds / image
 
 
-def load_cifar10(processor, device: str, train_pct: float = 0.25, test_pct: float = 0.25, num_workers: Optional[int] = None, seed: Optional[int] = None):
+def load_cifar10(processor, device: str, train_pct: float = 0.25, test_pct: float = 0.25, num_workers: Optional[int] = None):
     # Lazy imports
     from datasets import load_dataset
     from torchvision import transforms
@@ -158,24 +108,6 @@ def load_cifar10(processor, device: str, train_pct: float = 0.25, test_pct: floa
 
     if num_workers is None:
         num_workers = 2 if device != "cpu" else 0
-
-    # Опционально фиксируем seed до загрузки датасета и маппинга трансформаций
-    if seed is not None:
-        try:
-            from datasets import set_seed as hf_set_seed
-            hf_set_seed(seed)
-        except Exception:
-            pass
-        set_seed(seed)
-
-    # Генератор для детерминированного шафла и инициализация воркеров
-    if seed is not None:
-        gen = torch.Generator()
-        gen.manual_seed(seed)
-        seed_worker = seed_worker_init
-    else:
-        gen = None
-        seed_worker = None
 
     train_split = f"train[:{int(train_pct * 100)}%]"
     test_split = f"test[:{int(test_pct * 100)}%]"
@@ -206,12 +138,12 @@ def load_cifar10(processor, device: str, train_pct: float = 0.25, test_pct: floa
     train_ds.set_format(type="torch", columns=["pixel_values", "labels"])
     test_ds.set_format(type="torch", columns=["pixel_values", "labels"])
 
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"), generator=gen, worker_init_fn=seed_worker)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=(device == "cuda"))
     return train_loader, test_loader
 
 
-def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 2, num_workers: Optional[int] = None, img_size: int = 224, seed: Optional[int] = None):
+def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: float = 0.25, test_pct: float = 0.25, calib_per_class: int = 2, num_workers: Optional[int] = None, img_size: int = 224):
     # Lazy imports
     from datasets import load_dataset
     from torchvision import transforms
@@ -220,24 +152,6 @@ def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: floa
 
     if num_workers is None:
         num_workers = 2 if device != "cpu" else 0
-
-    # Опционально фиксируем seed до загрузки датасета и маппинга трансформаций
-    if seed is not None:
-        try:
-            from datasets import set_seed as hf_set_seed
-            hf_set_seed(seed)
-        except Exception:
-            pass
-        set_seed(seed)
-
-    # Генератор для детерминированного шафла и инициализация воркеров
-    if seed is not None:
-        gen = torch.Generator()
-        gen.manual_seed(seed)
-        seed_worker = seed_worker_init
-    else:
-        gen = None
-        seed_worker = None
 
     ds_name = dataset.lower()
     assert ds_name in ("cifar10", "cifar100"), f"Unsupported dataset: {dataset}"
@@ -307,9 +221,9 @@ def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: floa
     calib_ds.set_format(type="torch", columns=["pixel_values", "labels"])
 
     # DataLoaders
-    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"), generator=gen, worker_init_fn=seed_worker)
+    train_loader = DataLoader(train_ds, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
     test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=(device == "cuda"))
-    cal_loader = DataLoader(calib_ds, batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"), generator=gen, worker_init_fn=seed_worker)
+    cal_loader = DataLoader(calib_ds, batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
 
     return train_loader, test_loader, cal_loader
 
@@ -593,10 +507,6 @@ def run(args):
     device = pick_device()
     print(f"[INFO] Using device: {device}")
 
-    # Глобальный seed для детерминированного шафла/аугментаций/воркеров
-    if getattr(args, "seed", None) is not None:
-        set_seed(int(args.seed))
-
     run_id = time.strftime("%Y%m%d-%H%M%S")
 
     # Decide model source: HF or SRP timm checkpoint
@@ -679,7 +589,6 @@ def run(args):
             test_pct=args.cifar_test_pct,
             calib_per_class=getattr(args, "calib_per_class", 2),
             img_size=input_res,
-            seed=getattr(args, "seed", None),
         )
     else:
         train_loader = test_loader = cal_loader = None
@@ -1024,7 +933,6 @@ def build_argparser():
     p.add_argument("--adapter-reduction", type=int, default=4)
     p.add_argument("--save-adapter", action="store_true", help="Save adapter/classifier state dict")
     p.add_argument("--eval-batches", type=int, default=5, help="Max batches to use for quick evaluation")
-    p.add_argument("--seed", type=int, default=None, help="Global seed for deterministic shuffle/augs/DataLoader")
     p.add_argument("--load-adapter", type=str, default=None, help="Path to saved adapter.pt to load into model classifier")
     # SRP/timm checkpoint options
     p.add_argument("--use-srp-checkpoint", action="store_true", help="Load SRP timm checkpoint via models/index.csv instead of HF model")
