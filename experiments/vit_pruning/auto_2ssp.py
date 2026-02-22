@@ -17,6 +17,17 @@
 
 import argparse
 import os
+
+# NOTE: On some macOS/Python setups, importing Transformers' image-processing
+# classes can trigger TensorFlow/Keras -> pandas -> pyarrow import chain.
+# In this repo that can crash at import-time with:
+#   std::__1::system_error: mutex lock failed: Invalid argument
+# We don't use TF/Flax backends here, so force-disable them unless the user
+# explicitly opted in via env vars.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
 import time
 import json
 from pathlib import Path
@@ -25,7 +36,7 @@ from typing import Optional, Dict, Any
 import torch
 import torch.nn as nn
 
-from transformers import AutoImageProcessor, ViTForImageClassification
+from transformers import AutoImageProcessor, AutoModelForImageClassification, ViTForImageClassification
 import timm
 import re
 import csv
@@ -228,6 +239,211 @@ def load_cifar(processor, device: str, dataset: str = "cifar10", train_pct: floa
     return train_loader, test_loader, cal_loader
 
 
+# =====================
+# TinyImageNet loaders
+# =====================
+
+TINY_URL = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+
+
+def _download_with_progress(url: str, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    try:
+        from tqdm import tqdm
+    except Exception:
+        tqdm = None
+
+    if tqdm is None:
+        urllib.request.urlretrieve(url, out_path)
+        return
+
+    pbar = tqdm(unit="B", unit_scale=True, unit_divisor=1024, desc=f"Downloading {os.path.basename(out_path)}")
+
+    def reporthook(block_num, block_size, total_size):
+        if total_size and total_size > 0:
+            pbar.total = total_size
+        downloaded = block_num * block_size
+        pbar.update(downloaded - pbar.n)
+
+    urllib.request.urlretrieve(url, out_path, reporthook=reporthook)
+    pbar.close()
+
+
+def _is_tinyimagenet_present(root_dir: str) -> bool:
+    required = [
+        os.path.join(root_dir, "train"),
+        os.path.join(root_dir, "val"),
+        os.path.join(root_dir, "val", "images"),
+        os.path.join(root_dir, "val", "val_annotations.txt"),
+        os.path.join(root_dir, "wnids.txt"),
+    ]
+    return all(os.path.exists(p) for p in required)
+
+
+def ensure_tinyimagenet(root_dir: str = "datasets/tiny-imagenet-200", zip_cache: str = "datasets/tiny-imagenet-200.zip") -> None:
+    """Ensure TinyImageNet-200 exists locally. Downloads from Stanford if missing."""
+    if _is_tinyimagenet_present(root_dir):
+        print(f"[OK] TinyImageNet found at: {root_dir}")
+        return
+
+    print(f"[INFO] TinyImageNet missing/incomplete at: {root_dir}")
+    print(f"[INFO] Downloading from: {TINY_URL}")
+    _download_with_progress(TINY_URL, zip_cache)
+
+    import zipfile
+
+    extract_dir = os.path.dirname(root_dir) or "."
+    print(f"[INFO] Extracting to: {extract_dir}")
+    with zipfile.ZipFile(zip_cache, "r") as z:
+        z.extractall(extract_dir)
+
+    if not _is_tinyimagenet_present(root_dir):
+        raise RuntimeError("TinyImageNet extraction finished but dataset still looks incomplete.")
+    print(f"[OK] TinyImageNet ready at: {root_dir}")
+
+
+class TinyImageNetVal(torch.utils.data.Dataset):
+    """Validation dataset that uses the SAME class_to_idx mapping as ImageFolder(train)."""
+
+    def __init__(self, root: str, class_to_idx: dict, transform=None):
+        from PIL import Image
+
+        self._Image = Image
+        self.root = root
+        self.transform = transform
+        self.class_to_idx = class_to_idx
+
+        self.val_ann_path = os.path.join(root, "val", "val_annotations.txt")
+        self.val_img_dir = os.path.join(root, "val", "images")
+
+        self.samples = []
+        with open(self.val_ann_path, "r") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) < 2:
+                    continue
+                fname, wnid = parts[0], parts[1]
+                if wnid not in self.class_to_idx:
+                    continue
+                img_path = os.path.join(self.val_img_dir, fname)
+                label = int(self.class_to_idx[wnid])
+                self.samples.append((img_path, label))
+
+        if len(self.samples) == 0:
+            raise RuntimeError("No validation samples parsed. Check TinyImageNet structure.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        path, label = self.samples[idx]
+        img = self._Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+class _DictWrapper(torch.utils.data.Dataset):
+    def __init__(self, base):
+        self.base = base
+    def __len__(self):
+        return len(self.base)
+    def __getitem__(self, idx: int):
+        x, y = self.base[idx]
+        return {"pixel_values": x, "labels": int(y)}
+
+
+def load_tinyimagenet(
+    processor,
+    device: str,
+    data_dir: str = "datasets/tiny-imagenet-200",
+    train_pct: float = 0.25,
+    val_pct: float = 0.25,
+    calib_per_class: int = 2,
+    num_workers: Optional[int] = None,
+    img_size: int = 224,
+    seed: int = 0,
+):
+    """Return (train_loader, val_loader, cal_loader) in dict-batch format.
+
+    Uses torchvision ImageFolder for train and custom parser for val to preserve class mapping.
+    """
+    from torch.utils.data import DataLoader, Subset
+    from torchvision import datasets, transforms
+    from torchvision.transforms import InterpolationMode
+
+    if num_workers is None:
+        num_workers = 2 if device != "cpu" else 0
+
+    ensure_tinyimagenet(data_dir)
+
+    mean = getattr(processor, "image_mean", [0.5, 0.5, 0.5])
+    std = getattr(processor, "image_std", [0.5, 0.5, 0.5])
+    normalize = transforms.Normalize(mean=mean, std=std)
+
+    train_tf = transforms.Compose([
+        transforms.Resize((img_size, img_size), interpolation=InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    val_tf = transforms.Compose([
+        transforms.Resize((img_size, img_size), interpolation=InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    train_dir = os.path.join(data_dir, "train")
+    full_train = datasets.ImageFolder(train_dir, transform=train_tf)
+    # Deterministic (no aug) view for calibration
+    full_train_det = datasets.ImageFolder(train_dir, transform=val_tf)
+    full_val = TinyImageNetVal(data_dir, class_to_idx=full_train.class_to_idx, transform=val_tf)
+
+    # Optional deterministic subsampling
+    g = torch.Generator().manual_seed(int(seed))
+
+    def _subsample(ds, pct: float):
+        if pct is None or pct >= 1.0:
+            return ds
+        n = len(ds)
+        n_small = max(1, min(n, int(round(pct * n))))
+        idx = torch.randperm(n, generator=g)[:n_small].tolist()
+        return Subset(ds, idx)
+
+    train_ds = _subsample(full_train, train_pct)
+    val_ds = _subsample(full_val, val_pct)
+
+    # Calibration subset: at least calib_per_class per class from *full* train
+    num_classes = len(getattr(full_train, "classes", [])) or 200
+    counts = [0] * num_classes
+    calib_idx = []
+    # full_train.samples: list[(path,label)]
+    for i, (_p, y) in enumerate(getattr(full_train, "samples", [])):
+        y = int(y)
+        if 0 <= y < num_classes and counts[y] < int(calib_per_class):
+            calib_idx.append(i)
+            counts[y] += 1
+            if all(c >= int(calib_per_class) for c in counts):
+                break
+    # Fallback: at least 1 per class
+    if any(c == 0 for c in counts):
+        for i, (_p, y) in enumerate(getattr(full_train, "samples", [])):
+            y = int(y)
+            if 0 <= y < num_classes and counts[y] == 0:
+                calib_idx.append(i)
+                counts[y] = 1
+            if all(c >= 1 for c in counts):
+                break
+
+    cal_ds = Subset(full_train_det, calib_idx)
+
+    train_loader = DataLoader(_DictWrapper(train_ds), batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
+    val_loader = DataLoader(_DictWrapper(val_ds), batch_size=64, shuffle=False, num_workers=num_workers, pin_memory=(device == "cuda"))
+    cal_loader = DataLoader(_DictWrapper(cal_ds), batch_size=64, shuffle=True, num_workers=num_workers, pin_memory=(device == "cuda"))
+
+    return train_loader, val_loader, cal_loader
+
+
 def maybe_finetune_head(model: nn.Module, train_loader, device: str, freeze_backbone: bool, epochs: int = 1, lr: float = 5e-5):
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
@@ -268,8 +484,25 @@ def maybe_finetune_head(model: nn.Module, train_loader, device: str, freeze_back
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
             with torch.autocast(device_type=autocast_dev, enabled=True):
-                out = model(pixel_values=pixel_values)
-                loss = criterion(out.logits, labels)
+                # Support both HF (keyword pixel_values -> outputs.logits) and timm (positional -> tensor)
+                try:
+                    out = model(pixel_values=pixel_values)
+                except TypeError:
+                    try:
+                        out = model(pixel_values)
+                    except Exception:
+                        out = model(x=pixel_values) if hasattr(model, "forward") else model(pixel_values)
+
+                if isinstance(out, torch.Tensor):
+                    logits = out
+                elif hasattr(out, "logits"):
+                    logits = out.logits
+                elif isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
+                    logits = out[0]
+                else:
+                    raise RuntimeError("Model forward output is not a tensor or does not contain logits")
+
+                loss = criterion(logits, labels)
 
             if device == "cuda" and scaler is not None:
                 scaler.scale(loss).backward()
@@ -509,8 +742,53 @@ def run(args):
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
 
-    # Decide model source: HF or SRP timm checkpoint
+    # Decide model source: HF, SRP timm checkpoint, or TinyImageNet timm checkpoint
     input_res = 224
+    backend = "hf"
+    weights_source = "hf_pretrained"
+
+    def _load_hf_processor(model_id: str):
+        """Load processor/feature-extractor with broad compatibility.
+
+        Some transformers versions may not have a dedicated ImageProcessor for DeiT models.
+        In that case we fall back to AutoFeatureExtractor, and if that fails use mean/std defaults.
+        """
+        try:
+            return AutoImageProcessor.from_pretrained(model_id, use_fast=True)
+        except Exception as e1:
+            try:
+                from transformers import AutoFeatureExtractor  # type: ignore
+
+                fe = AutoFeatureExtractor.from_pretrained(model_id)
+                return fe
+            except Exception as e2:
+                print(f"[WARN] Failed to load HF image processor for '{model_id}'. Using defaults. ({e1} | {e2})")
+                return SimpleNamespace(image_mean=[0.5, 0.5, 0.5], image_std=[0.5, 0.5, 0.5])
+
+    def _get_backbone_module(m: nn.Module):
+        # HuggingFace naming convention: base_model_prefix (e.g. 'vit', 'deit')
+        pref = getattr(m, "base_model_prefix", None)
+        if isinstance(pref, str) and hasattr(m, pref):
+            return getattr(m, pref)
+        # Common fallbacks
+        for attr in ("vit", "deit", "backbone", "model", "base_model"):
+            if hasattr(m, attr):
+                return getattr(m, attr)
+        return m
+
+    def _load_timm_checkpoint(model_name: str, checkpoint_path: str, num_classes: int, device: str):
+        tm = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+        sd = torch.load(checkpoint_path, map_location="cpu")
+        missing, unexpected = tm.load_state_dict(sd, strict=False)
+        # Common pattern: DeiT distilled models have an extra 'head_dist' when created with distilled variant.
+        if missing or unexpected:
+            print(f"[WARN] timm.load_state_dict: missing={len(missing)}, unexpected={len(unexpected)}")
+            if missing:
+                print(f"[WARN] missing keys (first 10): {missing[:10]}")
+            if unexpected:
+                print(f"[WARN] unexpected keys (first 10): {unexpected[:10]}")
+        tm.to(device).eval()
+        return tm
     if getattr(args, "use_srp_checkpoint", False):
         model_name = args.model
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
@@ -531,30 +809,78 @@ def run(args):
             timm_model = load_model_timm('B/16', ds_name_srp, verbose=True)
         model = timm2transformers(model, timm_model)
         input_res = 224
+        backend = "hf"
+        weights_source = "srp_timm_to_hf"
         # Disable head changes and finetuning for SRP models by default
         args.use_adapter = False
         args.replace_classifier = False
         args.freeze_backbone = False
         args.do_finetune = False
     else:
-        model_name = args.model
-        processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
-        model = ViTForImageClassification.from_pretrained(model_name)
-        input_res = 224
+        # If a timm checkpoint is provided, we can skip loading any HF weights/processor.
+        if getattr(args, "timm_checkpoint", None):
+            ckpt = args.timm_checkpoint
+            tm_name = getattr(args, "timm_model_name", None)
+            if not tm_name:
+                raise ValueError("--timm-checkpoint requires --timm-model-name")
+            num_classes = getattr(args, "num_classes", None)
+            if num_classes is None:
+                # infer from dataset
+                ds_cli = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
+                num_classes = 200 if ds_cli == "tinyimagenet" else (100 if ds_cli == "cifar100" else 10)
+            model = _load_timm_checkpoint(tm_name, ckpt, int(num_classes), device)
+            backend = "timm"
+            weights_source = os.path.basename(ckpt)
+            model_name = tm_name
 
-    # Determine dataset-derived number of labels if CIFAR is requested
-    ds_name = None
+            cfg = getattr(model, "default_cfg", {}) or {}
+            input_res = int(getattr(args, "img_size", None) or cfg.get("input_size", (3, 224, 224))[-1] or 224)
+
+            proc_mean = cfg.get("mean", [0.5, 0.5, 0.5])
+            proc_std = cfg.get("std", [0.5, 0.5, 0.5])
+            processor = SimpleNamespace(image_mean=proc_mean, image_std=proc_std)
+        else:
+            # HF model by default (supports ViT and DeiT)
+            model_name = args.model
+            processor = _load_hf_processor(model_name)
+            model = AutoModelForImageClassification.from_pretrained(model_name)
+            input_res = int(getattr(args, "img_size", None) or 224)
+            backend = "hf"
+            weights_source = "hf_pretrained"
+
+    # Determine dataset-derived number of labels
+    ds_name = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
     expected_num_labels = None
-    if args.load_cifar:
-        ds_name = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
-        expected_num_labels = 10 if ds_name == "cifar10" else 100
+    if ds_name == "cifar10":
+        expected_num_labels = 10
+    elif ds_name == "cifar100":
+        expected_num_labels = 100
+    elif ds_name == "tinyimagenet":
+        expected_num_labels = 200
+    else:
+        expected_num_labels = None
 
-    if not getattr(args, "use_srp_checkpoint", False):
+    if backend == "hf" and not getattr(args, "use_srp_checkpoint", False):
         hidden = model.config.hidden_size
         # Configure classifier / adapter (HF model path)
         if getattr(args, "load_adapter", None):
             model = load_cifar_adapter(args.load_adapter, model)
-            print(f"[INFO] Loaded adapter from: {args.load_adapter} (num_labels={getattr(model.config,'num_labels', None)}, type={model.classifier.__class__.__name__})")
+
+            # NOTE: distilled DeiT uses cls_classifier/distillation_classifier. We expose a
+            # best-effort alias `model.classifier` for logging, but the real forward uses
+            # the specific head modules.
+            head_type = None
+            try:
+                if hasattr(model, "classifier") and isinstance(getattr(model, "classifier"), nn.Module):
+                    head_type = model.classifier.__class__.__name__
+                elif hasattr(model, "cls_classifier"):
+                    head_type = getattr(model, "cls_classifier").__class__.__name__
+            except Exception:
+                head_type = None
+
+            print(
+                f"[INFO] Loaded adapter from: {args.load_adapter} (num_labels={getattr(model.config,'num_labels', None)}, head={head_type})"
+            )
         else:
             if args.use_adapter:
                 original_out = model.classifier.out_features
@@ -571,20 +897,54 @@ def run(args):
                 model.config.num_labels = out_dim
                 print(f"[INFO] Replaced classifier for {out_dim} classes")
         if args.freeze_backbone:
-            for p in model.vit.parameters():
+            bb = _get_backbone_module(model)
+            for p in bb.parameters():
                 p.requires_grad = False
             print("[INFO] Backbone frozen; training head-only")
     else:
-        print("[INFO] Using SRP timm checkpoint; skipping head/adapter changes and backbone freezing.")
+        # timm/SRP models: do not apply HF-specific head/adapter logic.
+        if backend == "timm" and getattr(args, "freeze_backbone", False):
+            # For timm ViT/DeiT the classification head is typically `head` (and `head_dist` for distilled variants).
+            for p in model.parameters():
+                p.requires_grad_(False)
+            for head_attr in ("head", "head_dist"):
+                if hasattr(model, head_attr):
+                    head_mod = getattr(model, head_attr)
+                    if isinstance(head_mod, nn.Module):
+                        for p in head_mod.parameters():
+                            p.requires_grad_(True)
+            print("[INFO] timm backbone frozen; training head-only")
+
+        if backend == "timm":
+            print("[INFO] Using timm model; skipping HF head/adapter replacement.")
+        else:
+            print("[INFO] Using SRP timm checkpoint; skipping head/adapter changes and backbone freezing.")
 
     model.to(device)
 
     # Data
-    if args.load_cifar:
+    train_loader = test_loader = cal_loader = None
+    ds_cli = (getattr(args, "dataset", "cifar10") or "cifar10").lower()
+    if ds_cli == "tinyimagenet":
+        if args.load_cifar:
+            print("[WARN] --load-cifar was set but --dataset=tinyimagenet; ignoring --load-cifar and using TinyImageNet loaders.")
+        train_loader, test_loader, cal_loader = load_tinyimagenet(
+            processor,
+            device,
+            data_dir=getattr(args, "tiny_dir", "datasets/tiny-imagenet-200"),
+            train_pct=getattr(args, "tiny_train_pct", 0.25),
+            val_pct=getattr(args, "tiny_val_pct", 0.25),
+            calib_per_class=getattr(args, "calib_per_class", 2),
+            img_size=input_res,
+            seed=getattr(args, "seed", 0),
+        )
+        # For consistency in reports
+        ds_name = "tinyimagenet"
+    elif args.load_cifar:
         train_loader, test_loader, cal_loader = load_cifar(
             processor,
             device,
-            dataset=ds_name or (getattr(args, "dataset", "cifar10") or "cifar10"),
+            dataset=ds_cli,
             train_pct=args.cifar_train_pct,
             test_pct=args.cifar_test_pct,
             calib_per_class=getattr(args, "calib_per_class", 2),
@@ -630,15 +990,29 @@ def run(args):
 
     # Build importance via Auto2SSPInterface once (used by Stage-1/2)
     calib_loader_for_iface = cal_loader if cal_loader is not None else (train_loader if train_loader is not None else test_loader)
+
+    iface_importance_mode = (args.depth_importance if args.depth_importance in ("copy", "heuristic") else "heuristic")
+    # When the user requested Stage-1 only, attention depth importance is not used at all.
+    # Computing it in 'copy' mode is very expensive (baseline + B ablations), and looks like a hang.
+    if args.stage == "s1":
+        if iface_importance_mode == "copy":
+            print("[INFO] --stage s1: attention importance in 'copy' mode is not needed; forcing --depth-importance=heuristic to avoid long per-block evaluation.")
+        iface_importance_mode = "heuristic"
+    elif iface_importance_mode == "copy" and calib_loader_for_iface is not None:
+        print(f"[INFO] depth-importance=copy will run ~{B} extra evals (one per block) with up to {args.eval_batches} batches each; this can take minutes on {device}.")
+
+    print(f"[STEP] Computing importance via Auto2SSPInterface.fit (mode={iface_importance_mode}, batch_limit={args.eval_batches})")
+    t_imp0 = time.time()
     iface = Auto2SSPInterface(
         model=model,
         pruning_dataloader=calib_loader_for_iface,
         device=device,
-        importance_mode=(args.depth_importance if args.depth_importance in ("copy", "heuristic") else "heuristic"),
+        importance_mode=iface_importance_mode,
         batch_limit=args.eval_batches,
         min_remaining=args.min_remaining,
     )
     att_imp, mlp_imp = iface.fit()
+    print(f"[STEP] Importance computed in {time.time() - t_imp0:.1f}s")
 
     if args.stage in ("both", "s1"):
         if args.stage == "both":
@@ -858,6 +1232,9 @@ def run(args):
     report = {
         "config": {
             "model": model_name,
+            "backend": backend,
+            "weights_source": weights_source,
+            "img_size": input_res,
             "target_sparsity": args.target,
             "stage": args.stage,
             "s1_sparsity": args.s1_sparsity,
@@ -920,10 +1297,28 @@ def build_argparser():
     p.add_argument("--s2-sparsity", type=float, default=None, help="Component-wise sparsity for Attention (fraction of attention params / blocks). Used when --stage s2.")
     p.add_argument("--min-remaining", type=int, default=512, help="Min remaining intermediate size per block after width pruning")
     p.add_argument("--load-cifar", action="store_true", help="Load CIFAR-10/100 for quick accuracy evaluation")
-    p.add_argument("--dataset", type=str, default="cifar10", choices=["cifar10", "cifar100"], help="When --load-cifar is set, choose dataset variant.")
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar10",
+        choices=["cifar10", "cifar100", "tinyimagenet"],
+        help="Dataset to evaluate on. For CIFAR you must also pass --load-cifar. For TinyImageNet loaders are used automatically.",
+    )
     p.add_argument("--calib-per-class", type=int, default=2, help="Min samples per class for Stage-1 calibration dataloader")
     p.add_argument("--cifar-train-pct", type=float, default=0.25)
     p.add_argument("--cifar-test-pct", type=float, default=0.25)
+
+    # TinyImageNet options
+    p.add_argument("--tiny-dir", type=str, default="datasets/tiny-imagenet-200", help="Path to TinyImageNet-200 root dir (contains train/ and val/)")
+    p.add_argument("--tiny-train-pct", type=float, default=0.25, help="Fraction of TinyImageNet train split to use (1.0 = full)")
+    p.add_argument("--tiny-val-pct", type=float, default=0.25, help="Fraction of TinyImageNet val split to use (1.0 = full)")
+    p.add_argument("--seed", type=int, default=0, help="Seed used for deterministic subsampling (TinyImageNet) and misc RNG")
+
+    # Optional timm checkpoint override (useful for TinyImageNet weights from external repos)
+    p.add_argument("--timm-model-name", type=str, default=None, help="timm model name (e.g. vit_base_patch16_224, deit_base_distilled_patch16_384)")
+    p.add_argument("--timm-checkpoint", type=str, default=None, help="Path to a timm .pth checkpoint (state_dict). If set, loads a timm model instead of HF weights.")
+    p.add_argument("--img-size", type=int, default=None, help="Override input image size (e.g., 224 or 384). If omitted, inferred from timm default_cfg when using --timm-checkpoint.")
+    p.add_argument("--num-classes", type=int, default=None, help="Override number of classes for timm model construction (default inferred from --dataset)")
     p.add_argument("--do-finetune", action="store_true", help="Lightly fine-tune the head/adapter")
     p.add_argument("--ft-epochs", type=int, default=1)
     p.add_argument("--ft-lr", type=float, default=5e-5)
